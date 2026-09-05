@@ -63,15 +63,43 @@ When `proposal_type` is `generated_spec`, set `strategy` to
 }
 ```
 
-Available causal leaves are `close_above_sma`, `close_below_sma`,
-`close_above_ema`, `close_below_ema`, `return_above`, `return_below`,
-`breakout_above`, `breakdown_below`, `rsi_above`, `rsi_below`,
-`relative_volume_above`, `weekday`, `green_candle`, and `red_candle`.
-Compose them with `all`, `any`, and `not`. The supervisor enforces depth,
-window, leaf-count, and date boundaries before building a result. This is where
-the generator should explore ideas that are not already named in the zoo: a
-moving-average regime plus volume confirmation, a calendar gate plus momentum,
-or a breakout that exits on RSI failure.
+Available causal leaves, with what each threshold means (windows are in 4h
+bars; the supervisor sends the same table in every generated_spec prompt):
+
+| leaf | fields | threshold unit |
+|---|---|---|
+| `close_above_sma`, `close_below_sma`, `close_above_ema`, `close_below_ema` | window, threshold | percent band around the average; 0 = the average |
+| `breakout_above`, `breakdown_below` | window, threshold | percent beyond the prior-window high/low (excludes the current bar) |
+| `return_above`, `return_below` | window, threshold | fraction: 0.03 = +3% over the window |
+| `zscore_return_above`, `zscore_return_below` | window, threshold, `vol_window`? | sigma units: return / (per-bar vol x sqrt(window)); tsmom's statistic |
+| `rsi_above`, `rsi_below` | window, threshold | RSI level 0-100 |
+| `relative_volume_above` | window, threshold | ratio to the prior-window mean volume |
+| `vol_rank_above`, `vol_rank_below` | window, threshold, `rank_window`? | percentile 0-1 of realized volatility in its own history |
+| `market_zscore_above`, `market_zscore_below` | window, threshold, `vol_window`? | the same z-score on BTC_USDT, one bar late; the only leaf that reads another market |
+| `atr_trailing_stop` | window, threshold | ATR multiple k; true while in a position and close < highest close since entry - k x ATR; exit trees only |
+| `weekday` | day | 0-6 UTC, Sunday = 0 |
+| `green_candle`, `red_candle` | none | close above / below open |
+
+Compose them with `all`, `any`, and `not` (depth at most 4, at most six
+children per node). The JSON schema the supervisor sends describes each leaf's
+exact fields, so a malformed leaf cannot be generated. The C++ executor is
+`cli_trader/src/strategy/zoo/spec_strategy.h`; its truncation-invariance test
+covers every leaf.
+
+## What the supervisor tells you each call
+
+Every generator call carries, in this order: the evaluation setup (universe,
+folds, sizing, costs, development end); the incumbent's per-fold Sharpe and
+drawdown and the exact frontier condition; the repository's dead regions; the
+ledger counts; the STRATEGY ZOO, every registered family with its one-line
+provenance and its record in this ledger (names and sources only, never other
+families' parameter bounds); then the mode block. In `generated_spec` mode the
+zoo is the list of what a composed rule must not re-derive. In `generated_spec` mode the mode block is
+the leaf table above, the leaves over-used so far, the leaves never used, and
+the last eight specs already tested with their outcome. In family mode it is
+the scheduled family's parameter ranges and the parameter sets already tested
+for that family with their outcome. Use the ALREADY TESTED lists: repeating an
+entry there is rejected as a duplicate before any backtest runs.
 
 ## Prohibited output
 

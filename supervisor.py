@@ -37,6 +37,17 @@ DEFAULT_ARTIFACTS = PROJECT_ROOT / "artifacts-v2"
 DEFAULT_HEARTBEAT = PROJECT_ROOT / "state" / "heartbeat-v2.json"
 DEFAULT_CALIBRATION = PROJECT_ROOT / "state" / "null-calibration-v2.json"
 DEFAULT_MODEL = "gpt-oss:20b"
+# Context window for every Ollama call. The generator prompt runs 6.9k tokens
+# at the median and 7.9k at the maximum (measured 2026-09-05 on 44 recorded
+# proposals); at 8192 that left nothing for the model's reasoning channel and
+# 8 of 21 requests came back with empty content. 16k costs a few hundred MB
+# of KV cache on a 13 GB model and removes the ceiling.
+DEFAULT_NUM_CTX = 16384
+# Reasoning effort for the GENERATOR only. gpt-oss at its default "medium"
+# spends 1.7k-3.4k characters thinking per proposal; "low" measured 160-370
+# with identical validity and 2-4x lower latency. The reviewer model is not a
+# thinking model and must not receive the field at all (Ollama rejects it).
+DEFAULT_GENERATOR_THINK = "low"
 DEFAULT_REVIEWER_MODEL = "qwen3-coder:latest"
 DEFAULT_ENDPOINT = "http://127.0.0.1:11434"
 DEFAULT_OLLAMA_MIN_INTERVAL = 10.0
@@ -75,6 +86,11 @@ class ScheduledFocusSkipped(SupervisorError):
 
 class DuplicateProposal(SupervisorError):
     """A normalized candidate configuration already exists."""
+
+    def __init__(self, message: str, candidate_id: str | None = None, strategy: str | None = None) -> None:
+        super().__init__(message)
+        self.candidate_id = candidate_id
+        self.strategy = strategy
 
 
 class CircuitBreakerOpen(SupervisorError):
@@ -284,12 +300,30 @@ def parse_family_specs(output: str) -> dict[str, dict[str, tuple[float, float]]]
     return families
 
 
+def parse_family_catalogue(output: str) -> dict[str, str]:
+    """name -> one-line provenance, from the same `list-strategies` text parse_family_specs reads.
+
+    The provenance strings are the registry's own literature map ("Faber (2007)",
+    "Donchian's 4-week rule; the Turtle system", ...). Handed to the generator
+    they say what already exists as a named, tested family, so a generated rule
+    can be asked to cover what they do not, instead of re-deriving one of them.
+    """
+    catalogue: dict[str, str] = {}
+    for line in output.splitlines():
+        if line.startswith("Available strategies:"):
+            break
+        match = FAMILY_LINE.match(line)
+        if match:
+            catalogue[match.group(1)] = line[match.end():].strip()
+    return catalogue
+
+
 def parse_sparams(raw: str, family: dict[str, tuple[float, float]]) -> str:
     if not isinstance(raw, str):
         raise SupervisorError("sparams must be a string")
     if not raw:
         return ""
-    pieces = raw.split(",")
+    pieces = [piece.strip() for piece in raw.split(",") if piece.strip()]
     parsed: dict[str, float] = {}
     for piece in pieces:
         if not SAFE_SPARAM.fullmatch(piece):
@@ -311,7 +345,11 @@ def parse_sparams(raw: str, family: dict[str, tuple[float, float]]) -> str:
     return ",".join(f"{name}={value:g}" for name, value in sorted(parsed.items(), key=sort_key))
 
 
-def proposal_schema(mode: str | None = None, family: str | None = None) -> dict[str, Any]:
+def proposal_schema(
+    mode: str | None = None,
+    family: str | None = None,
+    family_parameters: dict[str, tuple[float, float]] | None = None,
+) -> dict[str, Any]:
     number = {"type": "number"}
     integer = {"type": "integer", "minimum": 10}
     schema = {
@@ -331,8 +369,8 @@ def proposal_schema(mode: str | None = None, family: str | None = None) -> dict[
             "weights": {"type": "string", "enum": ["equal"]},
             "vol_lookback": integer,
             "rebalance": {"type": "integer", "minimum": 1},
-            "mechanism": {"type": "string", "minLength": 20},
-            "reasoning": {"type": "string", "minLength": 20},
+            "mechanism": {"type": "string", "minLength": 80},
+            "reasoning": {"type": "string", "minLength": 40},
             "expected_failure_mode": {"type": "string", "minLength": 10},
             "novelty_key": {"type": "string", "minLength": 3, "maxLength": 128},
         },
@@ -342,13 +380,19 @@ def proposal_schema(mode: str | None = None, family: str | None = None) -> dict[
         schema["properties"]["strategy"] = {"type": "string", "enum": ["generated_spec"]}
         schema["properties"]["sparams"] = {"type": "string", "enum": [""]}
         schema["required"].append("spec")
+        # Ollama's constrained decoding honours $defs/$ref and anyOf (verified
+        # 2026-09-05 against gpt-oss:20b), so the rule tree is described
+        # exactly: one object shape per leaf with its exact required fields,
+        # and all/any/not nodes that recurse. An invalid leaf can then not be
+        # generated at all, instead of being rejected after a 30-second call.
+        schema["$defs"] = spec_rule_defs()
         schema["properties"]["spec"] = {
             "type": "object",
             "additionalProperties": False,
             "required": ["entry", "exit"],
             "properties": {
-                "entry": {"type": "object"},
-                "exit": {"type": "object"},
+                "entry": {"$ref": "#/$defs/node"},
+                "exit": {"$ref": "#/$defs/node"},
                 "max_hold_bars": {"type": "integer", "minimum": 0, "maximum": 2000},
             },
         }
@@ -370,12 +414,189 @@ def proposal_schema(mode: str | None = None, family: str | None = None) -> dict[
         }
     elif family:
         schema["properties"]["strategy"] = {"type": "string", "enum": [family]}
+        if family_parameters is not None and not family_parameters:
+            schema["properties"]["sparams"] = {"type": "string", "enum": [""]}
     return schema
+
+
+def spec_rule_defs() -> dict[str, Any]:
+    """JSON-schema $defs for the generated_spec rule tree, derived from LEAF_SPEC."""
+    leaves = []
+    for name, spec in LEAF_SPEC.items():
+        props: dict[str, Any] = {"type": {"type": "string", "enum": [name]}}
+        for field in spec["fields"]:
+            if field == "window":
+                props["window"] = {"type": "integer", "minimum": 2, "maximum": 600}
+            elif field == "threshold":
+                lo, hi = spec["range"]
+                props["threshold"] = {"type": "number", "minimum": lo, "maximum": hi}
+            elif field == "day":
+                props["day"] = {"type": "integer", "minimum": 0, "maximum": 6}
+        for extra in spec["extra"]:
+            lo, hi = SECONDARY_WINDOW_RANGE[extra]
+            props[extra] = {"type": "integer", "minimum": lo, "maximum": hi}
+        leaves.append({"type": "object", "additionalProperties": False,
+                       "required": ["type", *spec["fields"]], "properties": props})
+    children = {"type": "array", "minItems": 1, "maxItems": 6, "items": {"$ref": "#/$defs/node"}}
+    node = {"anyOf": [
+        {"$ref": "#/$defs/leaf"},
+        {"type": "object", "additionalProperties": False, "required": ["all"], "properties": {"all": children}},
+        {"type": "object", "additionalProperties": False, "required": ["any"], "properties": {"any": children}},
+        {"type": "object", "additionalProperties": False, "required": ["not"], "properties": {"not": {"$ref": "#/$defs/node"}}},
+    ]}
+    return {"leaf": {"anyOf": leaves}, "node": node}
+
+
+def leaf_reference_lines() -> list[str]:
+    """The leaf table as prompt text: name, fields and the threshold's unit."""
+    lines = []
+    for name, spec in LEAF_SPEC.items():
+        fields = ", ".join(spec["fields"] + tuple(f"{e}?" for e in spec["extra"])) or "no fields"
+        lines.append(f"- {name} ({fields}): {spec['unit']}")
+    return lines
+
+
+GENERATOR_SYSTEM = (
+    "You are the generator for a local quantitative research supervisor that studies long/flat "
+    "rules on 4-hour crypto candles. Return exactly one JSON object matching the supplied schema; "
+    "the schema is the contract, the prose below is the context. Never emit commands, file paths, "
+    "source code, holdout references or deployment advice; the deterministic evaluator computes "
+    "every metric and you must not claim one. Scheduled mode is {focus}: propose that and nothing "
+    "else. A good proposal states a MECHANISM - why prices should behave this way, in terms of who "
+    "is forced to trade, what information arrives slowly, or what risk is being paid for - and one "
+    "concrete way it fails. Restating the parameters is not a mechanism. Do not re-propose a "
+    "configuration listed under ALREADY TESTED; change the mechanism, not a digit. The novelty_key "
+    "is a short slug such as donchian:wide-entry:atr-stop and belongs in no other field."
+)
+
+
+def generator_prompts(focus: str, attempt: int, feedback: str, mission: dict[str, Any],
+                      families: dict[str, dict[str, tuple[float, float]]],
+                      incumbent_rows: list[dict[str, Any]] | None,
+                      recent_specs: list[dict[str, Any]],
+                      recent_sparams: list[dict[str, Any]],
+                      leaf_usage: dict[str, int],
+                      counts: dict[str, int],
+                      calibration: dict[str, Any] | None,
+                      catalogue: dict[str, str] | None = None,
+                      family_outcomes: dict[str, dict[str, Any]] | None = None) -> tuple[str, str]:
+    """Build (system, user) for one generator call. Pure: everything it says comes from its arguments.
+
+    What the model is told, and why:
+      * the evaluation in one paragraph (universe, folds, sizing, costs) - so
+        window choices are made in bars of the right size;
+      * the incumbent's fold Sharpes and what 'beats it' means - the target,
+        not just 'do well';
+      * what has ALREADY been tested in this mode, with outcomes - the model
+        cannot avoid duplicates it cannot see, and 32 of today's 74 rejected
+        proposals were duplicates;
+      * for specs: every leaf with its threshold UNIT (percent vs fraction vs
+        sigma vs percentile), plus which leaves are over-used so the search
+        moves rather than re-deriving moving-average rules with weekday gates;
+      * the repository's dead regions and the weekday convention;
+      * the STRATEGY ZOO: every registered family with its one-line provenance
+        and its outcome in this ledger - names only, never the other families'
+        parameter bounds, which the model cannot act on once the schema pins
+        the strategy and which cost 2.5k tokens per call. In spec mode the
+        catalogue is what the generated rule must NOT re-derive.
+    """
+    evaluation = mission["evaluation"]
+    folds = ", ".join(f"{a}..{b}" for a, b in evaluation["folds"])
+    symbols = ", ".join(mission["universe"]["protocol_symbols"])
+    header = [
+        f"EVALUATION. Universe {symbols} at 4h bars (6 bars per day, 2190 per year); folds {folds}; "
+        f"{evaluation.get('warmup_bars', 80)} warm-up bars; positions sized to {float(evaluation['vol_target']):.0%} "
+        f"annualized volatility, equal sleeve weights; next-bar-open fills, 0.15% fee and 0.05% slippage per side. "
+        f"Development data ends {mission['data_policy']['development_end']}; nothing later exists for you.",
+    ]
+    if incumbent_rows:
+        cells = ", ".join(f"fold{i + 1} Sharpe {float(r['sharpe']):.2f} (drawdown {float(r['max_drawdown_pct']):.1f}%)"
+                          for i, r in enumerate(incumbent_rows))
+        header.append(
+            f"INCUMBENT. {mission['incumbent']['strategy']} {mission['incumbent']['sparams']}: {cells}. "
+            "A candidate reaches the frontier when its mean fold Sharpe exceeds the incumbent's, no fold "
+            "trails by more than 0.25, its worst drawdown is not worse, and it clears the random-control null"
+            + (f" (99th percentile mean excess Sharpe vs the basket {calibration['quantiles']['mean_excess_sharpe_vs_basket_q99']:.2f})" if calibration else "")
+            + ". A candidate with half the incumbent's drawdown and similar Sharpe is also recorded as a risk reducer."
+        )
+    priors = RESEARCH_PRIORS
+    header.append("DEAD REGIONS (measured; a proposal here needs a materially different mechanism): "
+                  + "; ".join(priors["dead_regions"]) + ".")
+    header.append(f"LEDGER so far: {json.dumps(counts, sort_keys=True)}.")
+    if catalogue:
+        lines = []
+        for name, provenance in catalogue.items():
+            outcome = (family_outcomes or {}).get(name)
+            if outcome and outcome.get("tested"):
+                best = outcome.get("best_vs_incumbent")
+                tag = f" [tested {outcome['tested']}x" + (f", best {best:+.2f} vs incumbent]" if best is not None else "]")
+            else:
+                tag = " [untested here]"
+            lines.append(f"- {name}: {provenance[:110]}{tag}")
+        header.append(
+            ("STRATEGY ZOO (every family the evaluator already has, with its source and its record in this ledger). "
+             + ("In generated_spec mode: do not rebuild any of these out of leaves; compose a rule that covers a mechanism they do not."
+                if focus == "generated_spec" else
+                f"The scheduled family is {focus}; the rest is orientation, their parameters are not available in this call.")
+             + "\n" + "\n".join(lines))
+        )
+
+    if focus == "generated_spec":
+        used = sorted(leaf_usage.items(), key=lambda kv: -kv[1])
+        over = [name for name, _ in used[:4]]
+        under = [name for name in LEAF_SPEC if leaf_usage.get(name, 0) == 0]
+        body = [
+            "MODE: generated_spec. Set proposal_type=generated_spec, strategy=generated_spec, sparams=\"\".",
+            "spec = {entry, exit, max_hold_bars}. entry and exit are boolean rule trees: a leaf, or {\"all\": [...]}, "
+            "{\"any\": [...]} with 1-6 children, or {\"not\": node}; depth at most 4 and at most "
+            f"{int(mission['limits']['max_parameters'])} leaves in total. max_hold_bars 0 means no time stop.",
+            "LEAVES (name (fields): what the threshold means). Windows are in 4h bars: 6 = one day, 42 = one week, 180 = one month.",
+            *leaf_reference_lines(),
+            "Rules: atr_trailing_stop only makes sense in exit; market_zscore_* is the only leaf that sees another market; "
+            f"weekday uses {priors['calendar_weekday_convention']}.",
+            "Every leaf is a prediction about the next bars. Combine leaves that carry DIFFERENT information "
+            "(trend, volatility regime, participation, the market factor, a risk stop) rather than three views of the same average.",
+        ]
+        if over:
+            body.append(f"OVER-USED so far (avoid building yet another rule around these): {', '.join(over)}."
+                        + (f" NEVER USED yet: {', '.join(under)}." if under else ""))
+        if recent_specs:
+            body.append("ALREADY TESTED (entry -> exit; outcome; mean Sharpe vs incumbent):")
+            for item in recent_specs:
+                delta = item.get("sharpe_vs_incumbent")
+                body.append(f"  {json.dumps(item['entry'], separators=(',', ':'))} -> {json.dumps(item['exit'], separators=(',', ':'))}; "
+                            f"{item['outcome']}; {'n/a' if delta is None else f'{delta:+.2f}'}")
+    elif focus == "feature_request":
+        body = [
+            "MODE: feature_request. Set strategy=feature_request and sparams=\"\". Provide "
+            "feature={name,description,transformation,publication_lag_days} for a LOCAL data series a human "
+            "could supply; never a URL. This is a note for a human, not a runnable rule.",
+        ]
+    else:
+        bounds = families.get(focus, {})
+        body = [f"MODE: family. Set proposal_type=family and strategy={focus}."]
+        if bounds:
+            body.append("PARAMETERS and legal ranges for this family (sparams is a comma-separated name=value list using "
+                        "only these names; an empty string means the published defaults): "
+                        + json.dumps({k: [lo, hi] for k, (lo, hi) in bounds.items()}))
+            body.append("The repository measured flat plateaus in these parameters: a small tweak is noise. Propose a "
+                        "setting that expresses a different regime or horizon and say why.")
+        else:
+            body.append("This family has no tunable parameters: sparams must be the empty string exactly.")
+        if recent_sparams:
+            body.append("ALREADY TESTED for this family (sparams; outcome; mean Sharpe vs incumbent):")
+            for item in recent_sparams:
+                delta = item.get("sharpe_vs_incumbent")
+                body.append(f"  {item['sparams'] or '(defaults)'}; {item['outcome']}; {'n/a' if delta is None else f'{delta:+.2f}'}")
+    tail = [f"ATTEMPT {attempt} of 3." + (f" PREVIOUS ATTEMPT REJECTED: {feedback}" if feedback else ""),
+            "Return only the proposal JSON object."]
+    return GENERATOR_SYSTEM.format(focus=focus), "\n".join(header + [""] + body + [""] + tail)
 
 
 class OllamaClient:
     def __init__(self, endpoint: str, model: str, timeout: float = 180.0,
-                 min_interval: float = DEFAULT_OLLAMA_MIN_INTERVAL) -> None:
+                 min_interval: float = DEFAULT_OLLAMA_MIN_INTERVAL,
+                 num_ctx: int = DEFAULT_NUM_CTX, think: str | None = None) -> None:
         parsed = urllib.parse.urlparse(endpoint)
         try:
             port = parsed.port
@@ -392,6 +613,8 @@ class OllamaClient:
         self.endpoint = "http://127.0.0.1:11434"
         self.model = model
         self.timeout = timeout
+        self.num_ctx = int(num_ctx)
+        self.think = think          # None = leave the model's default; "low"/"medium"/"high" for thinking models
         self.min_interval = max(0.0, float(min_interval))
         self.next_request_at = 0.0
         self.failure_streak = 0
@@ -444,9 +667,11 @@ class OllamaClient:
             "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
             "stream": False,
             "format": format_schema or proposal_schema(),
-            "options": {"temperature": 0.7, "num_ctx": 8192},
+            "options": {"temperature": 0.7, "num_ctx": self.num_ctx},
             "keep_alive": "10m",
         }
+        if self.think is not None:
+            payload["think"] = self.think
         response = self._request("/api/chat", payload)
         message = response.get("message", {})
         content = message.get("content") if isinstance(message, dict) else None
@@ -687,6 +912,127 @@ class Registry:
                 failures[strategy] = failures.get(strategy, 0.0) + math.exp(-age_hours / 24.0)
         return failures
 
+    def strategy_duplicate_failures(self) -> dict[str, float]:
+        failures: dict[str, float] = {}
+        now = dt.datetime.now(dt.timezone.utc)
+        for row in self.db.execute(
+            "SELECT candidate_id, payload_json, created_at FROM events "
+            "WHERE event_type='duplicate_proposal' ORDER BY event_id DESC LIMIT 200"
+        ):
+            try:
+                payload = json.loads(row["payload_json"])
+                strategy = payload.get("strategy")
+                created = dt.datetime.fromisoformat(row["created_at"])
+            except (TypeError, ValueError, AttributeError, json.JSONDecodeError):
+                continue
+            if not isinstance(strategy, str) and row["candidate_id"]:
+                candidate = self.db.execute(
+                    "SELECT proposal_json FROM candidates WHERE candidate_id=?",
+                    (row["candidate_id"],),
+                ).fetchone()
+                if candidate is not None:
+                    try:
+                        strategy = json.loads(candidate["proposal_json"]).get("strategy")
+                    except (TypeError, json.JSONDecodeError):
+                        strategy = None
+            if isinstance(strategy, str):
+                age_hours = max(0.0, (now - created).total_seconds() / 3600.0)
+                failures[strategy] = failures.get(strategy, 0.0) + math.exp(-age_hours / 24.0)
+        return failures
+
+    def recent_spec_configs(self, limit: int = 8) -> list[dict[str, Any]]:
+        """entry/exit trees of the most recent generated_spec candidates, with outcome."""
+        out = []
+        for row in self.db.execute(
+            "SELECT proposal_json, status, classification, summary_json FROM candidates ORDER BY created_at DESC LIMIT 200"
+        ):
+            try:
+                proposal = json.loads(row["proposal_json"])
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if proposal.get("proposal_type") != "generated_spec" or not proposal.get("spec"):
+                continue
+            outcome = row["classification"] or row["status"]
+            delta = None
+            if row["summary_json"]:
+                try:
+                    delta = json.loads(row["summary_json"]).get("mean_excess_sharpe_vs_incumbent")
+                except (TypeError, json.JSONDecodeError):
+                    delta = None
+            out.append({"entry": proposal["spec"].get("entry"), "exit": proposal["spec"].get("exit"),
+                        "outcome": outcome, "sharpe_vs_incumbent": delta})
+            if len(out) >= limit:
+                break
+        return out
+
+    def recent_family_sparams(self, strategy: str, limit: int = 12) -> list[dict[str, Any]]:
+        """sparams already tried for one family, with outcome, newest first."""
+        out = []
+        for row in self.db.execute(
+            "SELECT proposal_json, status, classification, summary_json FROM candidates ORDER BY created_at DESC LIMIT 400"
+        ):
+            try:
+                proposal = json.loads(row["proposal_json"])
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if proposal.get("strategy") != strategy:
+                continue
+            delta = None
+            if row["summary_json"]:
+                try:
+                    delta = json.loads(row["summary_json"]).get("mean_excess_sharpe_vs_incumbent")
+                except (TypeError, json.JSONDecodeError):
+                    delta = None
+            out.append({"sparams": proposal.get("sparams", ""), "outcome": row["classification"] or row["status"],
+                        "sharpe_vs_incumbent": delta})
+            if len(out) >= limit:
+                break
+        return out
+
+    def family_outcomes(self) -> dict[str, dict[str, Any]]:
+        """Per strategy: how many candidates were evaluated and the best mean Sharpe vs the incumbent."""
+        out: dict[str, dict[str, Any]] = {}
+        for row in self.db.execute("SELECT proposal_json, summary_json FROM candidates"):
+            try:
+                strategy = json.loads(row["proposal_json"]).get("strategy")
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if not isinstance(strategy, str):
+                continue
+            entry = out.setdefault(strategy, {"tested": 0, "best_vs_incumbent": None})
+            entry["tested"] += 1
+            if row["summary_json"]:
+                try:
+                    delta = json.loads(row["summary_json"]).get("mean_excess_sharpe_vs_incumbent")
+                except (TypeError, json.JSONDecodeError):
+                    delta = None
+                if isinstance(delta, (int, float)) and (entry["best_vs_incumbent"] is None or delta > entry["best_vs_incumbent"]):
+                    entry["best_vs_incumbent"] = float(delta)
+        return out
+
+    def spec_leaf_usage(self) -> dict[str, int]:
+        """How often each leaf type appears across every recorded generated spec."""
+        counts: dict[str, int] = {}
+
+        def walk(node: Any) -> None:
+            if isinstance(node, dict):
+                if isinstance(node.get("type"), str):
+                    counts[node["type"]] = counts.get(node["type"], 0) + 1
+                for value in node.values():
+                    walk(value)
+            elif isinstance(node, list):
+                for value in node:
+                    walk(value)
+
+        for (proposal_json,) in self.db.execute("SELECT proposal_json FROM candidates"):
+            try:
+                proposal = json.loads(proposal_json)
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if proposal.get("spec"):
+                walk(proposal["spec"])
+        return counts
+
     def proposed_candidates(self) -> list[sqlite3.Row]:
         return list(self.db.execute("SELECT * FROM candidates WHERE status='proposed' ORDER BY created_at"))
 
@@ -773,12 +1119,38 @@ def numeric(value: Any, field: str) -> float:
     return float(value)
 
 
-SPEC_LEAVES = {
-    "close_above_sma", "close_below_sma", "close_above_ema", "close_below_ema",
-    "return_above", "return_below", "breakout_above", "breakdown_below",
-    "rsi_above", "rsi_below", "relative_volume_above", "weekday",
-    "green_candle", "red_candle",
+# One table drives the validator, the JSON schema handed to Ollama, and the
+# prompt, so the model is told exactly what the C++ executor
+# (cli_trader/src/strategy/zoo/spec_strategy.h) will accept and in which unit.
+#   fields:  required leaf fields beyond "type"
+#   extra:   optional secondary windows the leaf accepts
+#   range:   legal threshold range (None = no threshold)
+#   unit:    what the threshold means, in the model's words
+LEAF_SPEC: dict[str, dict[str, Any]] = {
+    "close_above_sma": {"fields": ("window", "threshold"), "extra": (), "range": (-100.0, 100.0), "unit": "percent band around the SMA; 0 = the average itself"},
+    "close_below_sma": {"fields": ("window", "threshold"), "extra": (), "range": (-100.0, 100.0), "unit": "percent band around the SMA"},
+    "close_above_ema": {"fields": ("window", "threshold"), "extra": (), "range": (-100.0, 100.0), "unit": "percent band around the EMA"},
+    "close_below_ema": {"fields": ("window", "threshold"), "extra": (), "range": (-100.0, 100.0), "unit": "percent band around the EMA"},
+    "breakout_above": {"fields": ("window", "threshold"), "extra": (), "range": (-100.0, 100.0), "unit": "percent above the prior-window high (excludes the current bar)"},
+    "breakdown_below": {"fields": ("window", "threshold"), "extra": (), "range": (-100.0, 100.0), "unit": "percent below the prior-window low"},
+    "return_above": {"fields": ("window", "threshold"), "extra": (), "range": (-2.0, 2.0), "unit": "fraction: 0.03 means +3% over the window"},
+    "return_below": {"fields": ("window", "threshold"), "extra": (), "range": (-2.0, 2.0), "unit": "fraction: -0.05 means -5% over the window"},
+    "zscore_return_above": {"fields": ("window", "threshold"), "extra": ("vol_window",), "range": (-5.0, 5.0), "unit": "sigma units: trailing return / (per-bar vol * sqrt(window)); tsmom's own statistic, 0.5 is the live default"},
+    "zscore_return_below": {"fields": ("window", "threshold"), "extra": ("vol_window",), "range": (-5.0, 5.0), "unit": "sigma units, negative for a downtrend"},
+    "rsi_above": {"fields": ("window", "threshold"), "extra": (), "range": (0.0, 100.0), "unit": "RSI level 0-100"},
+    "rsi_below": {"fields": ("window", "threshold"), "extra": (), "range": (0.0, 100.0), "unit": "RSI level 0-100"},
+    "relative_volume_above": {"fields": ("window", "threshold"), "extra": (), "range": (0.0, 20.0), "unit": "ratio of this bar's volume to the prior-window mean; 2 = twice normal"},
+    "vol_rank_above": {"fields": ("window", "threshold"), "extra": ("rank_window",), "range": (0.0, 1.0), "unit": "percentile 0-1 of realized volatility within its own trailing history (rank_window bars, default 250)"},
+    "vol_rank_below": {"fields": ("window", "threshold"), "extra": ("rank_window",), "range": (0.0, 1.0), "unit": "percentile 0-1; 0.3 means calmer than 70% of recent history"},
+    "market_zscore_above": {"fields": ("window", "threshold"), "extra": ("vol_window",), "range": (-5.0, 5.0), "unit": "the same z-score read on BTC_USDT, the market factor, one bar late; the ONLY leaf that uses information outside the coin itself"},
+    "market_zscore_below": {"fields": ("window", "threshold"), "extra": ("vol_window",), "range": (-5.0, 5.0), "unit": "BTC z-score below the level, one bar late"},
+    "atr_trailing_stop": {"fields": ("window", "threshold"), "extra": (), "range": (0.5, 10.0), "unit": "ATR multiple k: true while a position is open and close < highest close since entry - k*ATR(window); EXIT trees only, always false in an entry tree"},
+    "weekday": {"fields": ("day",), "extra": (), "range": None, "unit": "day 0-6 in UTC, Sunday=0, Monday=1, ... Saturday=6"},
+    "green_candle": {"fields": (), "extra": (), "range": None, "unit": "close above open on this bar"},
+    "red_candle": {"fields": (), "extra": (), "range": None, "unit": "close below open on this bar"},
 }
+SPEC_LEAVES = set(LEAF_SPEC)
+SECONDARY_WINDOW_RANGE = {"vol_window": (2, 600), "rank_window": (20, 2000)}
 
 
 def normalize_spec_node(value: Any, depth: int = 0) -> dict[str, Any]:
@@ -816,7 +1188,7 @@ def normalize_spec_node(value: Any, depth: int = 0) -> dict[str, Any]:
     aliases = {"sma_window": "window", "level": "threshold"}
     normalized = {"type": leaf}
     for key, item in payload.items():
-        if key in {"window", "threshold", "day"}:
+        if key in {"window", "threshold", "day", "vol_window", "rank_window"}:
             normalized[key] = item
         elif key in aliases:
             normalized[aliases[key]] = item
@@ -842,32 +1214,35 @@ def validate_spec_node(value: Any, depth: int = 0) -> int:
         if not isinstance(children, list) or not 1 <= len(children) <= 8:
             raise SupervisorError(f"generated spec {key} must contain 1..8 rules")
         return sum(validate_spec_node(child, depth + 1) for child in children)
-    if set(value) - {"type", "window", "threshold", "day"}:
-        raise SupervisorError("generated spec leaf has unknown fields")
     leaf = value.get("type")
-    if leaf not in SPEC_LEAVES:
+    if leaf not in LEAF_SPEC:
         raise SupervisorError(f"unknown generated spec leaf: {leaf!r}")
-    if leaf == "weekday":
+    spec = LEAF_SPEC[leaf]
+    allowed = {"type", *spec["fields"], *spec["extra"]}
+    if set(value) - allowed:
+        raise SupervisorError(f"generated spec leaf {leaf} has unknown fields: {sorted(set(value) - allowed)}")
+    for field in spec["fields"]:
+        if field not in value:
+            raise SupervisorError(f"generated spec {leaf} requires {field}")
+    if "day" in spec["fields"]:
         day = value.get("day")
         if isinstance(day, bool) or not isinstance(day, int) or not 0 <= day <= 6:
             raise SupervisorError("generated spec weekday day must be an integer from 0 to 6")
-        return 1
-    if leaf not in {"green_candle", "red_candle", "weekday"}:
+    if "window" in spec["fields"]:
         window = value.get("window")
         if isinstance(window, bool) or not isinstance(window, int) or not 2 <= window <= 600:
             raise SupervisorError("generated spec window must be an integer from 2 to 600")
-        if "threshold" not in value:
-            raise SupervisorError(f"generated spec {leaf} requires threshold")
+    if spec["range"] is not None:
         threshold = numeric(value["threshold"], "generated spec threshold")
-        if leaf in {"rsi_above", "rsi_below"} and not 0.0 <= threshold <= 100.0:
-            raise SupervisorError("RSI threshold must be in [0,100]")
-        if leaf == "relative_volume_above" and not 0.0 <= threshold <= 20.0:
-            raise SupervisorError("relative-volume threshold must be in [0,20]")
-        if leaf in {"return_above", "return_below"} and not -2.0 <= threshold <= 2.0:
-            raise SupervisorError("return threshold is a fraction and must be in [-2,2]")
-        if leaf in {"close_above_sma", "close_below_sma", "close_above_ema", "close_below_ema",
-                    "breakout_above", "breakdown_below"} and not -100.0 <= threshold <= 100.0:
-            raise SupervisorError("price/channel threshold is a percent and must be in [-100,100]")
+        lo, hi = spec["range"]
+        if not lo <= threshold <= hi:
+            raise SupervisorError(f"{leaf} threshold must be in [{lo:g},{hi:g}] ({spec['unit']})")
+    for extra in spec["extra"]:
+        if extra in value:
+            lo, hi = SECONDARY_WINDOW_RANGE[extra]
+            item = value[extra]
+            if isinstance(item, bool) or not isinstance(item, int) or not lo <= item <= hi:
+                raise SupervisorError(f"generated spec {extra} must be an integer from {lo} to {hi}")
     return 1
 
 
@@ -932,6 +1307,14 @@ def validate_proposal(raw: dict[str, Any], mission: dict[str, Any], families: di
     for field, minimum in (("mechanism", 20), ("reasoning", 20), ("expected_failure_mode", 10), ("novelty_key", 3)):
         if not isinstance(raw[field], str) or len(raw[field].strip()) < minimum:
             raise SupervisorError(f"{field} is too short")
+    # A mechanism that is only leaf or parameter names ("market_zscore_above +
+    # vol_rank_above") is a restatement, not a mechanism; the reviewer cannot
+    # grade it and the ledger cannot learn from it. Eight words with at least
+    # half of them ordinary prose is the cheapest test that rejects that.
+    words = [w for w in re.split(r"\s+", raw["mechanism"].strip()) if w]
+    prose = [w for w in words if re.fullmatch(r"[A-Za-z][a-z]*[,.;:]?", w)]
+    if len(words) < 8 or len(prose) * 2 < len(words):
+        raise SupervisorError("mechanism must be at least eight words of prose explaining why prices should behave that way, not a list of leaf or parameter names")
     strategy = raw["strategy"]
     spec = None
     feature = None
@@ -1034,7 +1417,9 @@ class Supervisor:
                  heartbeat_path: Path = DEFAULT_HEARTBEAT,
                  calibration_path: Path = DEFAULT_CALIBRATION,
                  ollama_min_interval: float = DEFAULT_OLLAMA_MIN_INTERVAL,
-                 reviewer_model: str = DEFAULT_REVIEWER_MODEL) -> None:
+                 reviewer_model: str = DEFAULT_REVIEWER_MODEL,
+                 num_ctx: int = DEFAULT_NUM_CTX,
+                 generator_think: str | None = DEFAULT_GENERATOR_THINK) -> None:
         self.mission_path = mission_path.resolve()
         self.mission = validate_mission(self.mission_path)
         self.mission_hash = sha256_file(self.mission_path)
@@ -1046,8 +1431,10 @@ class Supervisor:
         self.source_revision = git_revision(self.repo)
         self.model = model
         self.reviewer_model = reviewer_model
-        self.client = OllamaClient(endpoint, model, timeout, ollama_min_interval)
-        self.reviewer_client = OllamaClient(endpoint, reviewer_model, timeout, ollama_min_interval)
+        self.client = OllamaClient(endpoint, model, timeout, ollama_min_interval,
+                                   num_ctx=num_ctx, think=generator_think)
+        self.reviewer_client = OllamaClient(endpoint, reviewer_model, timeout, ollama_min_interval,
+                                            num_ctx=num_ctx, think=None)
         self.db = Registry(db_path)
         self.artifacts = artifacts
         self.heartbeat_path = heartbeat_path
@@ -1057,6 +1444,7 @@ class Supervisor:
         self.db.mission(self.mission, self.mission_path, model)
         self.recover_inflight_candidates()
         self.families = self.discover_families()
+        self.catalogue = self.discover_catalogue()
         self.reconcile_proposals()
         self.seed_best_history()
 
@@ -1122,6 +1510,13 @@ class Supervisor:
             "updated_at": utc_now(),
         })
 
+    def discover_catalogue(self) -> dict[str, str]:
+        completed = subprocess.run(
+            [str(self.binary), "list-strategies"], cwd=self.repo, text=True,
+            capture_output=True, timeout=30, check=False, env=safe_child_environment(),
+        )
+        return parse_family_catalogue(completed.stdout) if completed.returncode == 0 else {}
+
     def discover_families(self) -> dict[str, dict[str, tuple[float, float]]]:
         completed = subprocess.run(
             [str(self.binary), "list-strategies"], cwd=self.repo, text=True,
@@ -1176,6 +1571,7 @@ class Supervisor:
     def state_context(self) -> dict[str, Any]:
         strategy_counts = self.db.strategy_counts()
         focus_failures = self.db.strategy_focus_failures()
+        duplicate_failures = self.db.strategy_duplicate_failures()
         focus_order = self.mission.get("search_policy", {}).get("preferred_sequence", [])
         schedule_features = bool(self.mission.get("search_policy", {}).get("schedule_feature_requests", False))
         candidates = [
@@ -1185,12 +1581,18 @@ class Supervisor:
         ]
         if not candidates:
             candidates = ["generated_spec"]
-        if all(focus_failures.get(name, 0) > 0 for name in candidates):
-            candidates = ["generated_spec"]
+        # No collapse rule here. Failure counts decay exponentially and never
+        # reach zero, so "every family has failed at least once" became true
+        # for good at 19:34 on 2026-09-05 and every later iteration was routed
+        # to generated_spec. A fresh failure now costs a family roughly ten
+        # candidates' worth of priority and fades over a day.
+        FAILURE_WEIGHT = 10.0
         target = min(
             candidates,
             key=lambda name: (
-                strategy_counts.get(name, 0) + 1000 * focus_failures.get(name, 0),
+                strategy_counts.get(name, 0)
+                + FAILURE_WEIGHT * focus_failures.get(name, 0)
+                + FAILURE_WEIGHT * duplicate_failures.get(name, 0),
                 candidates.index(name),
             ),
         )
@@ -1199,6 +1601,7 @@ class Supervisor:
             "counts": self.db.counts(),
             "strategy_counts": strategy_counts,
             "strategy_focus_failures": focus_failures,
+            "strategy_duplicate_failures": duplicate_failures,
             "null_calibration": {
                 "ready": calibration is not None,
                 "mean_q99": None if calibration is None else calibration["quantiles"]["mean_excess_sharpe_vs_basket_q99"],
@@ -1370,55 +1773,54 @@ class Supervisor:
         })
         return calibration
 
+    def incumbent_summary(self) -> list[dict[str, Any]] | None:
+        """The incumbent's fold results, computed once per process (three 0.05 s backtests)."""
+        if not hasattr(self, "_incumbent_cache"):
+            try:
+                self._incumbent_cache = self.incumbent_folds()
+            except SupervisorError as error:
+                self.db.event("incumbent_summary_failed", {"error": str(error)})
+                self._incumbent_cache = None
+        return self._incumbent_cache
+
     def generate_proposal(self) -> tuple[dict[str, Any], str, dict[str, Any]]:
         focus = self.state_context()["next_search_focus"]["strategy"]
-        system = (
-            "You are the generator agent for a local quantitative research supervisor. "
-            "Return exactly one JSON object matching the supplied schema. Propose the "
-            "scheduled strategy only. Do not emit commands, "
-            "paths, source code, holdout references, or deployment advice. State a real causal "
-            "mechanism and an expected failure mode. The deterministic evaluator decides metrics. "
-            "Use sparams only from the selected strategy family. Set novelty_key to a short "
-            "slug such as donchian:wide-entry:atr-stop, never a sentence. "
-            f"Scheduled mode is {focus}. Follow the mode-specific schema and context exactly."
-        )
         feedback = ""
         for attempt in range(1, 4):
-            if focus == "generated_spec":
-                context = [
-                    "MISSION: local causal development research only; development_end=2023-12-31.",
-                    "Return exactly one proposal_type=generated_spec JSON object.",
-                    "Set strategy=generated_spec and sparams=\"\".",
-                    "The spec MUST have exactly entry, exit, and optional max_hold_bars.",
-                    "entry and exit are rule trees using only all, any, not and these leaf objects:",
-                    "{type:close_above_sma|close_below_sma|close_above_ema|close_below_ema,window:INTEGER,threshold:NUMBER}",
-                    "{type:return_above|return_below|breakout_above|breakdown_below,window:INTEGER,threshold:NUMBER}",
-                    "{type:rsi_above|rsi_below|relative_volume_above,window:INTEGER,threshold:NUMBER}",
-                    "{type:weekday,day:0..6} or {type:green_candle} or {type:red_candle}; weekday uses UTC Sunday=0, Monday=1, ... Saturday=6.",
-                    "Do not include sparams, strategy parameters, ATR names, custom indicators, URLs, or extra spec fields.",
-                    "Minimal valid spec example: {\"entry\":{\"all\":[{\"type\":\"close_above_sma\",\"window\":50,\"threshold\":0}]},\"exit\":{\"type\":\"close_below_sma\",\"window\":50,\"threshold\":0},\"max_hold_bars\":0}.",
-                ]
-            elif focus == "feature_request":
-                context = [
-                    "MISSION: local-only development research; no network data.",
-                    "Return exactly one proposal_type=feature_request JSON object.",
-                    "Set strategy=feature_request and sparams=\"\".",
-                    "Provide feature={name,description,transformation,publication_lag_days}; do not include spec or custom strategy parameters.",
-                ]
-            else:
-                context = [
-                    "MISSION:", json.dumps({key: value for key, value in self.mission.items() if not key.startswith("_")}, indent=2),
-                    "REGISTERED FAMILIES AND PARAMETER BOUNDS:", json.dumps(self.families, sort_keys=True),
-                    f"SCHEDULED STRATEGY (attempt {attempt}/3): {focus}",
-                ]
-            user = "\n".join(context + [
-                "CURRENT RESEARCH STATE:", json.dumps(self.model_context(), sort_keys=True),
-                feedback, "Return only the proposal JSON object.",
-            ])
-            schema_mode = "generated_spec" if focus == "generated_spec" else "feature_request" if focus == "feature_request" else None
-            content, response = self.client.chat(
-                system, user, proposal_schema(schema_mode, None if schema_mode else focus)
+            system, user = generator_prompts(
+                focus, attempt, feedback, self.mission, self.families,
+                self.incumbent_summary(),
+                self.db.recent_spec_configs(8) if focus == "generated_spec" else [],
+                self.db.recent_family_sparams(focus, 12) if focus not in ("generated_spec", "feature_request") else [],
+                self.db.spec_leaf_usage() if focus == "generated_spec" else {},
+                self.db.counts(), self.load_calibration(),
+                self.catalogue, self.db.family_outcomes(),
             )
+            schema_mode = "generated_spec" if focus == "generated_spec" else "feature_request" if focus == "feature_request" else None
+            try:
+                content, response = self.client.chat(
+                    system,
+                    user,
+                    proposal_schema(
+                        schema_mode,
+                        None if schema_mode else focus,
+                        None if schema_mode else self.families.get(focus),
+                    ),
+                )
+            except SupervisorError as error:
+                self.db.event("proposal_request_error", {
+                    "strategy": focus,
+                    "attempt": attempt,
+                    "error": str(error),
+                })
+                feedback = (
+                    "The previous Ollama request failed before producing a proposal: "
+                    + str(error)
+                    + ". Retry with one complete JSON object only."
+                )
+                if attempt == 3:
+                    raise
+                continue
             try:
                 raw = extract_json(content)
             except SupervisorError as error:
@@ -1483,7 +1885,9 @@ class Supervisor:
 
             if proposal_type != ("generated_spec" if focus == "generated_spec" else
                                  "feature_request" if focus == "feature_request" else "family"):
-                self.record_invalid_proposal(content, f"model used proposal_type={proposal_type} outside scheduled mode {focus}")
+                error = f"model used proposal_type={proposal_type} outside scheduled mode {focus}"
+                self.record_invalid_proposal(content, error)
+                feedback = "Your previous response was invalid: " + error + ". Return the scheduled proposal type only."
                 continue
             if raw.get("proposal_type") == "generated_spec" and focus == "generated_spec":
                 raw["strategy"] = "generated_spec"
@@ -1492,17 +1896,35 @@ class Supervisor:
                     validate_proposal(raw, self.mission, self.families)
                 except SupervisorError as error:
                     self.record_invalid_proposal(content, str(error))
+                    feedback = (
+                        "Your previous family proposal was invalid: " + str(error)
+                        + f". Return strategy={focus!r} and use only the legal sparams shown for that family."
+                    )
                     continue
                 return raw, content, response
-            self.record_invalid_proposal(content, f"model ignored scheduled strategy {focus}")
+            error = f"model ignored scheduled strategy {focus}"
+            self.record_invalid_proposal(content, error)
+            feedback = "Your previous response was invalid: " + error + ". Return the exact scheduled strategy only."
         self.db.event("scheduled_strategy_failed", {"strategy": focus, "attempts": 3})
         raise ScheduledFocusSkipped(f"model failed to follow scheduled strategy {focus} after 3 attempts")
 
     def record_proposal(self, raw: dict[str, Any], raw_content: str, response: dict[str, Any]) -> dict[str, Any]:
         candidate = validate_proposal(raw, self.mission, self.families)
         if self.db.has_config(candidate["config_hash"]):
-            self.db.event("duplicate_proposal", {"config_hash": candidate["config_hash"]}, candidate["candidate_id"])
-            raise DuplicateProposal(f"duplicate candidate configuration: {candidate['candidate_id']}")
+            self.db.event(
+                "duplicate_proposal",
+                {
+                    "config_hash": candidate["config_hash"],
+                    "strategy": candidate["proposal"]["strategy"],
+                    "sparams": candidate["proposal"]["sparams"],
+                },
+                candidate["candidate_id"],
+            )
+            raise DuplicateProposal(
+                f"duplicate candidate configuration: {candidate['candidate_id']}",
+                candidate["candidate_id"],
+                candidate["proposal"]["strategy"],
+            )
         initial_status = "blocked_missing_feature" if candidate["proposal"]["proposal_type"] == "feature_request" else "proposed"
         if candidate["proposal"]["proposal_type"] == "generated_spec":
             write_json(self.artifacts / candidate["candidate_id"] / "spec.json", candidate["proposal"]["spec"])
@@ -1793,6 +2215,25 @@ class Supervisor:
                     self.db.event("iteration_skipped", {"reason": str(error), "iteration": iteration})
                     self.write_heartbeat("idle", iteration, last_candidate_id)
                     print(json.dumps({"iteration": iteration, "status": "skipped", "reason": str(error)}), flush=True)
+                except DuplicateProposal as error:
+                    self.db.event(
+                        "iteration_skipped",
+                        {
+                            "reason": str(error),
+                            "iteration": iteration,
+                            "focus": focus,
+                            "candidate_id": error.candidate_id,
+                        },
+                        error.candidate_id,
+                    )
+                    self.write_heartbeat("idle", iteration, last_candidate_id)
+                    print(json.dumps({
+                        "iteration": iteration,
+                        "status": "duplicate_skipped",
+                        "candidate_id": error.candidate_id,
+                        "strategy": error.strategy,
+                        "reason": str(error),
+                    }), flush=True)
                 except CircuitBreakerOpen as error:
                     self.db.event("daemon_paused", {"reason": str(error), "iteration": iteration})
                     self.write_heartbeat("paused", iteration, last_candidate_id, str(error))
@@ -1863,13 +2304,31 @@ def classify_results(results: list[dict[str, Any]], incumbent: list[dict[str, An
         summary["mean_excess_sharpe_vs_incumbent"] = sum(deltas) / len(deltas)
         summary["worst_excess_sharpe_vs_incumbent"] = min(deltas)
         summary["incumbent_worst_drawdown_pct"] = max(incumbent_drawdowns)
+        # A two-year fold carries a Sharpe standard error of about 0.71, so
+        # demanding a strictly positive delta on every fold turned a -0.02 on
+        # one fold into a veto over candidates that won the other two by more
+        # than a full unit and cut drawdown by two thirds. The worst fold may
+        # lose by up to a third of one standard error; the mean must still win
+        # and the drawdown must not be worse.
+        WORST_FOLD_TOLERANCE = 0.25
+        summary["worst_fold_tolerance"] = WORST_FOLD_TOLERANCE
         summary["beats_incumbent"] = (
             screen_pass and summary["mean_excess_sharpe_vs_incumbent"] > 0.0 and
-            summary["worst_excess_sharpe_vs_incumbent"] > 0.0 and
+            summary["worst_excess_sharpe_vs_incumbent"] > -WORST_FOLD_TOLERANCE and
             summary["worst_drawdown_pct"] <= summary["incumbent_worst_drawdown_pct"]
+        )
+        # Risk reducer: not a Sharpe improvement, but the same or nearly the
+        # same return per unit of risk at half the drawdown. The live book's
+        # own justification is drawdown, not alpha, so this deserves a label
+        # rather than "gate failed".
+        summary["risk_reducer"] = (
+            screen_pass and not summary["beats_incumbent"] and
+            summary["mean_excess_sharpe_vs_incumbent"] >= -0.10 and
+            summary["worst_drawdown_pct"] <= 0.5 * summary["incumbent_worst_drawdown_pct"]
         )
     else:
         summary["beats_incumbent"] = False
+        summary["risk_reducer"] = False
 
     if calibration is None:
         summary["null_calibration_ready"] = False
@@ -1888,6 +2347,9 @@ def classify_results(results: list[dict[str, Any]], incumbent: list[dict[str, An
         summary["status"] = "frontier"
         summary["classification"] = "frontier_candidate"
         summary["promotion"] = "research_frontier_only"
+    elif screen_pass and summary.get("risk_reducer"):
+        summary["classification"] = "risk_reducer"
+        summary["promotion"] = "research_note_only"
     elif screen_pass:
         summary["classification"] = "incumbent_or_null_gate_failed"
     return summary
@@ -1898,6 +2360,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--mission", type=Path, default=DEFAULT_MISSION)
     parser.add_argument("--model", default=os.environ.get("OLLAMA_MODEL", DEFAULT_MODEL))
     parser.add_argument("--reviewer-model", default=os.environ.get("OLLAMA_REVIEWER_MODEL", DEFAULT_REVIEWER_MODEL))
+    parser.add_argument("--num-ctx", type=int, default=DEFAULT_NUM_CTX,
+                        help="Ollama context window for every call (default %(default)s)")
+    parser.add_argument("--generator-think", choices=["low", "medium", "high", "off"], default=DEFAULT_GENERATOR_THINK,
+                        help="reasoning effort for the generator model; 'off' sends no think field (default %(default)s)")
     parser.add_argument("--endpoint", default=os.environ.get("OLLAMA_HOST", DEFAULT_ENDPOINT))
     parser.add_argument("--timeout", type=float, default=180.0)
     parser.add_argument("--llm-min-interval", type=float, default=DEFAULT_OLLAMA_MIN_INTERVAL)
@@ -2011,6 +2477,7 @@ def main(argv: list[str] | None = None) -> int:
             args.mission.resolve(), args.model, args.endpoint, args.timeout,
             registry_path, args.artifacts.resolve(), args.heartbeat.resolve(),
             args.calibration.resolve(), args.llm_min_interval, args.reviewer_model,
+            args.num_ctx, None if args.generator_think == "off" else args.generator_think,
         )
         try:
             if args.command in {"propose", "run-once", "review", "daemon", "calibrate-null"}:

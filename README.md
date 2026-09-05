@@ -18,6 +18,7 @@ permission to access holdout data, edit live deployment files, or place orders.
 
 ## Start here
 
+- [Documentation: how it works, the loop, the CLI contract, the rule language](docs/README.md)
 - [Research plan](LOCAL_OLLAMA_RESEARCH_PLAN.md)
 - [Operations runbook](RUNBOOK.md)
 - [Active TODO](TODO.md)
@@ -37,7 +38,7 @@ The earlier v1 ledger remains historical and is not mixed with v2 evidence.
 - `supervisor.py` calls Ollama only on loopback and validates structured JSON;
 - the mission, strategy registry, and development boundary are checked before
 	proposals run;
-- proposals and fold artifacts are stored in SQLite and `artifacts/`;
+- proposals and fold artifacts are stored in SQLite and `artifacts-v2/`;
 - `propose`, `evaluate`, `review`, `status`, and bounded `daemon` commands work;
 - `generated_spec` lets the model compose new causal rule trees without editing
 	C++ or pretending that a parameter mutation is a new strategy;
@@ -55,7 +56,7 @@ The earlier v1 ledger remains historical and is not mixed with v2 evidence.
 The current candidates are research evidence only. Promotion is now blocked by
 the incumbent-relative and null-calibrated gates unless a candidate clears both.
 
-The null calibration is now stored in `state/null_calibration.json`. The first
+The null calibration is now stored in `state/null-calibration-v2.json`. The first
 200-seed calibration produced these development-only 99th-percentile gates:
 
 - mean excess Sharpe versus the basket: `0.4139`;
@@ -159,4 +160,26 @@ python3 supervisor.py daemon --interval 30 --max-iterations 3
 ```
 
 The daemon is development-only. It cannot emit a holdout command or edit the
-live deployment, and every candidate is stored under `state/` and `artifacts/`.
+live deployment, and every candidate is stored under `state/` and `artifacts-v2/`.
+
+## License
+
+Copyright (c) 2026 Ulises Merlan
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.

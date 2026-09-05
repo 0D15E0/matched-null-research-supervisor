@@ -4,13 +4,13 @@ This runbook describes how to operate the local research supervisor on the
 Mac. It is for the sibling project at:
 
 ```text
-/Users/ulimerlan/trader/local_ollama_research
+/path/to/local_ollama_research
 ```
 
 The source repository is:
 
 ```text
-/Users/ulimerlan/trader/cli_trader
+/path/to/cli_trader
 ```
 
 On this Mac, Homebrew Python/CMake may be unavailable if the terminal PATH has
@@ -50,7 +50,7 @@ recommendation.
 Before the first commit or remote upload, run:
 
 ```sh
-cd /Users/ulimerlan/trader/local_ollama_research
+cd /path/to/local_ollama_research
 /usr/bin/git status --short --untracked-files=all
 /usr/bin/git add -n .
 ```
@@ -60,12 +60,10 @@ small examples only. It should not contain `state/`, `artifacts/`,
 `artifacts-v2/`, `logs/`, databases, model outputs, feature datasets, or
 Python caches. The repository `.gitignore` is designed to enforce that.
 
-The runbook examples currently contain this machine's absolute workspace paths
-for copy/paste convenience. Before publishing to a public repository, replace
-`/Users/ulimerlan/trader/local_ollama_research` and
-`/Users/ulimerlan/trader/cli_trader` with generic project-root variables if
-revealing the local username or directory layout is undesirable. This is a
-privacy concern, not a credential leak.
+The runbook examples use generic checkout paths. Replace
+`/path/to/local_ollama_research` and `/path/to/cli_trader` with the paths on
+the local machine before running the commands. This keeps the public document
+free of machine-specific usernames and directory layouts.
 
 ## Directory Map
 
@@ -93,8 +91,8 @@ Do not delete them until their provenance has been archived.
 Check the native evaluator and local Ollama before starting:
 
 ```sh
-PROJECT=/Users/ulimerlan/trader/local_ollama_research
-CLI=/Users/ulimerlan/trader/cli_trader
+PROJECT=/path/to/local_ollama_research
+CLI=/path/to/cli_trader
 
 ollama --version
 ollama list
@@ -123,7 +121,7 @@ curl -fsS http://127.0.0.1:11434/api/tags
 If it is not running, use:
 
 ```sh
-cd /Users/ulimerlan/trader/local_ollama_research
+cd /path/to/local_ollama_research
 ./scripts/start_ollama.sh
 ```
 
@@ -134,7 +132,7 @@ start a second server.
 Install the local model tags when the model store is new or incomplete:
 
 ```sh
-cd /Users/ulimerlan/trader/local_ollama_research
+cd /path/to/local_ollama_research
 ./scripts/install_models.sh
 ```
 
@@ -143,7 +141,7 @@ cd /Users/ulimerlan/trader/local_ollama_research
 Run the supervisor doctor before the first daemon start:
 
 ```sh
-cd /Users/ulimerlan/trader/local_ollama_research
+cd /path/to/local_ollama_research
 /opt/homebrew/bin/python3 supervisor.py \
   --model gpt-oss:20b --reviewer-model qwen3-coder:latest doctor
 ```
@@ -169,7 +167,7 @@ If the C++ strategy registry or generated-spec executor changed, rebuild the
 source project before starting research:
 
 ```sh
-cd /Users/ulimerlan/trader/cli_trader
+cd /path/to/cli_trader
 cmake --build build -j2
 ctest --test-dir build --output-on-failure
 ```
@@ -183,7 +181,7 @@ writes `state/null-calibration-v2.json`.
 Run it once:
 
 ```sh
-cd /Users/ulimerlan/trader/local_ollama_research
+cd /path/to/local_ollama_research
 /opt/homebrew/bin/python3 supervisor.py \
   --model gpt-oss:20b --reviewer-model qwen3-coder:latest calibrate-null
 ```
@@ -211,7 +209,7 @@ normalization problems:
 
 ```sh
 /opt/homebrew/bin/python3 \
-  /Users/ulimerlan/trader/local_ollama_research/supervisor.py \
+  /path/to/local_ollama_research/supervisor.py \
   --model gpt-oss:20b --reviewer-model qwen3-coder:latest daemon --interval 30
 ```
 
@@ -237,7 +235,7 @@ between completed iterations; it does not replace request pacing.
 To choose a slower request rate explicitly:
 
 ```sh
-/opt/homebrew/bin/python3 /Users/ulimerlan/trader/local_ollama_research/supervisor.py \
+/opt/homebrew/bin/python3 /path/to/local_ollama_research/supervisor.py \
   --llm-min-interval 20 daemon --interval 60
 ```
 
@@ -245,7 +243,7 @@ For a controlled smoke run:
 
 ```sh
 /opt/homebrew/bin/python3 \
-  /Users/ulimerlan/trader/local_ollama_research/supervisor.py \
+  /path/to/local_ollama_research/supervisor.py \
   --model gpt-oss:20b --reviewer-model qwen3-coder:latest daemon \
   --interval 30 --max-iterations 3
 ```
@@ -258,14 +256,16 @@ bounded by a per-fold timeout, and the heartbeat is written as `stopped`.
 Single status snapshot:
 
 ```sh
-cd /Users/ulimerlan/trader/local_ollama_research
+cd /path/to/local_ollama_research
 /opt/homebrew/bin/python3 supervisor.py status
 ```
 
 Continuous status view:
 
 ```sh
-/opt/homebrew/bin/python3 supervisor.py status --watch --interval 5
+/opt/homebrew/bin/python3 \
+  /path/to/local_ollama_research/supervisor.py \
+  status --watch --interval 5
 ```
 
 Watch mode intentionally prints one compact live line per refresh. It shows
@@ -310,7 +310,7 @@ Candidate statuses mean:
 The durable current-best record is separate from the latest-candidate list:
 
 ```sh
-/opt/homebrew/bin/python3 /Users/ulimerlan/trader/local_ollama_research/supervisor.py best
+/opt/homebrew/bin/python3 /path/to/local_ollama_research/supervisor.py best
 ```
 
 It is stored in `state/best-v2.json` and backed by the SQLite `best_history`
@@ -331,7 +331,7 @@ Use the CLI view:
 
 ```sh
 /opt/homebrew/bin/python3 \
-  /Users/ulimerlan/trader/local_ollama_research/supervisor.py best
+  /path/to/local_ollama_research/supervisor.py best
 ```
 
 The same record is stored in `state/best-v2.json` and backed by the SQLite
@@ -406,7 +406,7 @@ Feature requests are a separate side queue:
 For candidate `CANDIDATE_ID`:
 
 ```sh
-cd /Users/ulimerlan/trader/local_ollama_research
+cd /path/to/local_ollama_research
 /usr/bin/find "artifacts-v2/CANDIDATE_ID" -maxdepth 2 -type f -print
 /bin/cat "artifacts-v2/CANDIDATE_ID/proposal.json"
 /bin/cat "artifacts-v2/CANDIDATE_ID/result.json"
@@ -439,7 +439,9 @@ Use `status --watch` for current health. It reports the current heartbeat error
 only; it does not repeat historical errors:
 
 ```sh
-/opt/homebrew/bin/python3 supervisor.py status --watch --interval 5
+/opt/homebrew/bin/python3 \
+  /path/to/local_ollama_research/supervisor.py \
+  status --watch --interval 5
 ```
 
 Important states:
@@ -475,7 +477,7 @@ Useful event types:
 | `candidate_reclassified` | Gates were recalculated |
 | `invalid_proposal` | Raw model output failed validation |
 | `duplicate_proposal` | Normalized configuration already exists |
-| `iteration_skipped` | A focus failed without an operational crash |
+| `iteration_skipped` | A focus failed or repeated a candidate without an operational crash |
 | `iteration_error` | The current iteration hit an operational error |
 | `circuit_breaker_open` | Consecutive invalid/duplicate limit was reached |
 | `doctor_pass` | Startup safety checks passed |
@@ -576,7 +578,7 @@ the experiment history.
 Stop the daemon before rebuilding:
 
 ```sh
-cd /Users/ulimerlan/trader/cli_trader
+cd /path/to/cli_trader
 cmake --build build -j2
 ctest --test-dir build --output-on-failure
 ```
@@ -590,7 +592,7 @@ mission ID and a new null calibration rather than mixing old and new evidence.
 Before maintenance:
 
 ```sh
-cd /Users/ulimerlan/trader/local_ollama_research
+cd /path/to/local_ollama_research
 mkdir -p state/backups
 /usr/bin/sqlite3 state/research-v2.sqlite3 \
   "backup 'state/backups/research-v2-$(/bin/date +%Y%m%d-%H%M%S).sqlite3'"
