@@ -1,0 +1,60 @@
+# Python caches and local environments
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+.env
+.env.*
+*.env
+!.env.example
+
+# Local research state, databases, locks, and checkpoints
+state/
+*.db
+*.sqlite
+*.sqlite3
+*.sqlite3-*
+*.sqlite-wal
+*.sqlite-shm
+*.lock
+
+# Model prompts, raw responses, fold logs, and generated research artifacts
+artifacts/
+artifacts-v2/
+logs/
+
+# Local feature data; keep the public contract documentation, never datasets
+features/*.csv
+features/*.csv.gz
+features/*.parquet
+features/*.json
+!features/README.md
+
+# Generated reports and temporary output
+*.tmp
+*.temp
+*.bak
+*.log
+/tmp/
+
+# macOS and editor metadata
+.DS_Store
+.AppleDouble
+.LSOverride
+.vscode/
+.idea/
+
+# Credentials and private material
+*.pem
+*.key
+*.p12
+*.pfx
+*.crt
+credentials.*
+secrets.*
+*secret*
+*token*

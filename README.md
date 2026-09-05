@@ -1,0 +1,162 @@
+# Matched-Null Research Supervisor
+
+Proposed repository name: `matched-null-research-supervisor`.
+
+This project hosts the local-only Ollama research supervisor for the
+deterministic trading engine in
+[matched-null_cli_trader_bot](https://github.com/0D15E0/matched-null_cli_trader_bot).
+The local checkout is expected at `../cli_trader` during development.
+
+The linked CLI trader repository is the source of the candle engine, strategy
+registry, portfolio evaluator, transaction-cost model, and development-fold
+backtests. This repository orchestrates local model proposals and feeds only
+validated, development-bound candidates into that engine.
+
+The supervisor uses Ollama on `127.0.0.1:11434` to propose and review trading
+hypotheses. It does not replace the deterministic C++ backtester, and it has no
+permission to access holdout data, edit live deployment files, or place orders.
+
+## Start here
+
+- [Research plan](LOCAL_OLLAMA_RESEARCH_PLAN.md)
+- [Operations runbook](RUNBOOK.md)
+- [Active TODO](TODO.md)
+- [Generator agent contract](agents/GENERATOR.md)
+- [Reviewer agent contract](agents/REVIEWER.md)
+- [Supervisor contract](agents/SUPERVISOR.md)
+- [active v2 mission](missions/local-trend-discovery-v2.json)
+- [historical v1 mission](missions/local-trend-discovery-v1.json)
+
+## Current status
+
+Phase 0/1 is operational:
+
+The active supervisor uses a fresh v2 ledger and protocol-matched settings.
+The earlier v1 ledger remains historical and is not mixed with v2 evidence.
+
+- `supervisor.py` calls Ollama only on loopback and validates structured JSON;
+- the mission, strategy registry, and development boundary are checked before
+	proposals run;
+- proposals and fold artifacts are stored in SQLite and `artifacts/`;
+- `propose`, `evaluate`, `review`, `status`, and bounded `daemon` commands work;
+- `generated_spec` lets the model compose new causal rule trees without editing
+	C++ or pretending that a parameter mutation is a new strategy;
+- `feature_request` lets the model record ideas requiring a local dataset
+	contract without fetching remote data or fabricating results;
+- feature requests are kept as a side queue and do not consume executable
+  strategy search slots;
+- the calibrated random-control null and incumbent comparison now separate
+  development survivors from `frontier` candidates;
+- local `qwen3-coder:latest` generated and reviewed development candidates;
+- the active generator is `gpt-oss:20b`; `qwen3-coder:latest` is retained for
+	evidence review;
+- no holdout or deployment command exists in the supervisor.
+
+The current candidates are research evidence only. Promotion is now blocked by
+the incumbent-relative and null-calibrated gates unless a candidate clears both.
+
+The null calibration is now stored in `state/null_calibration.json`. The first
+200-seed calibration produced these development-only 99th-percentile gates:
+
+- mean excess Sharpe versus the basket: `0.4139`;
+- worst-fold excess Sharpe versus the basket: `0.0111`.
+
+A candidate must also beat the deployed `ensemble_vote` on mean and worst-fold
+Sharpe, with no worse worst-fold drawdown, before it can be marked `frontier`.
+`frontier` still means research frontier only; it is not permission to use the
+holdout or deploy.
+
+The first implementation must use existing registered strategy families and
+fixed development folds from `../cli_trader`. Source-generating candidates,
+holdout validation, and deployment integration are explicitly out of scope
+until the proposal-only and deterministic evaluation stages have been proven.
+
+## Local runtime boundary
+
+Inference is local Ollama only:
+
+```text
+http://127.0.0.1:11434
+```
+
+The supervisor should fail closed if the endpoint is not loopback, if Ollama is
+unavailable, or if a proposal attempts to emit executable commands or paths.
+
+## Run It
+
+From this directory, install the local open-weight model tags and verify the
+runtime:
+
+```sh
+./scripts/install_models.sh
+python3 supervisor.py doctor
+```
+
+Generate one structured proposal without running a backtest:
+
+```sh
+python3 supervisor.py propose
+```
+
+Evaluate a recorded candidate on the fixed development folds, then ask the
+local reviewer to annotate its deterministic result:
+
+```sh
+python3 supervisor.py evaluate CANDIDATE_ID
+python3 supervisor.py review CANDIDATE_ID
+python3 supervisor.py status
+```
+
+Show the durable current-best record:
+
+```sh
+python3 supervisor.py best
+```
+
+Build the 200-seed development-only random-control null before relying on
+frontier labels:
+
+```sh
+python3 supervisor.py calibrate-null
+```
+
+Reclassify older development survivors after a new calibration:
+
+```sh
+python3 supervisor.py reclassify
+```
+
+Watch the daemon while it runs:
+
+```sh
+python3 supervisor.py status --watch --interval 5
+```
+
+The heartbeat retains the last candidate, current iteration, model, and latest
+error even after a bounded daemon exits, so the same command is useful for
+checking a stopped or crashed run.
+
+Status meanings:
+
+- `survives_development`: passes the basket-relative development screen;
+- `frontier`: also beats the deployed incumbent on mean and worst-fold Sharpe,
+	stays within its worst drawdown, and clears the null's 99th-percentile gates;
+- `blocked_missing_feature`: a creative idea is waiting for a human-supplied
+	local feature manifest.
+
+The scheduler supplies the generator with the least-tested family. It starts
+with `generated_spec`, then rotates through `calendar_rule`, moving-average,
+momentum, ensemble, breakout, and control families. This makes “try and try” an
+observable search process rather than an unbounded conversation that can repeat
+one idea.
+
+The first continuous mode is bounded during development with
+`--max-iterations`; omit it only after the loop has passed its restart and
+resource tests:
+
+```sh
+python3 supervisor.py daemon --interval 30 --max-iterations 3
+```
+
+The daemon is development-only. It cannot emit a holdout command or edit the
+live deployment, and every candidate is stored under `state/` and `artifacts/`.

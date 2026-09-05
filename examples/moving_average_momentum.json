@@ -1,0 +1,16 @@
+{
+  "name": "moving-average-momentum",
+  "entry": {
+    "all": [
+      {"type": "close_above_sma", "window": 50, "threshold": 0.0},
+      {"type": "return_above", "window": 20, "threshold": 0.03}
+    ]
+  },
+  "exit": {
+    "any": [
+      {"type": "close_below_sma", "window": 50, "threshold": 0.0},
+      {"type": "return_below", "window": 10, "threshold": -0.03}
+    ]
+  },
+  "max_hold_bars": 0
+}

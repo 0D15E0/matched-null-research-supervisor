@@ -1,0 +1,82 @@
+{
+  "mission_id": "local-trend-discovery-v1",
+  "description": "Local-only mechanism and robustness research for long/flat crypto strategies.",
+  "source_repo": "../cli_trader",
+  "data_policy": {
+    "development_end": "2023-12-31",
+    "holdout_start": "2024-01-01",
+    "allowed_data_dirs": ["../cli_trader/data"],
+    "forbidden_paths": ["../cli_trader/experiments/holdout.json", "../cli_trader/state_live", "../cli_trader/deploy"],
+    "allow_data_fetch": false
+  },
+  "allowed_commands": [
+    "portfolio",
+    "backtest",
+    "list-strategies",
+    "causality_check"
+  ],
+  "universe": {
+    "protocol_symbols": ["BTC_USDT", "ETH_USDT", "XRP_USDT", "LTC_USDT"],
+    "period_seconds": [14400]
+  },
+  "evaluation": {
+    "folds": [
+      ["2018-01-01", "2019-12-31"],
+      ["2020-01-01", "2021-12-31"],
+      ["2022-01-01", "2023-12-31"]
+    ],
+    "warmup_bars": 80,
+    "vol_target": 0.2,
+    "weights": "equal",
+    "vol_lookback": 120,
+    "rebalance": 30,
+    "primary_metric": "mean_excess_sharpe_vs_incumbent",
+    "required_metrics": [
+      "sharpe",
+      "excess_sharpe_vs_basket",
+      "excess_sharpe_vs_incumbent",
+      "worst_fold_excess",
+      "max_drawdown",
+      "sleeve_correlation",
+      "trades"
+    ]
+  },
+  "incumbent": {
+    "strategy": "ensemble_vote",
+    "sparams": "enterVotes=2,exitVotes=0",
+    "description": "Current research incumbent; not an automatic deployment recommendation."
+  },
+  "search_policy": {
+    "preferred_sequence": [
+      "generated_spec",
+      "feature_request",
+      "calendar_rule",
+      "faber_ma",
+      "sma_cross",
+      "tsmom",
+      "ensemble_vote",
+      "donchian",
+      "control_random",
+      "control_always_long"
+    ],
+    "require_uncovered_family_before_mutation": true,
+    "external_feature_policy": "proposal_only_until_a_local_feature_manifest_exists"
+  },
+  "null_calibration": {
+    "strategy": "control_random",
+    "seeds": 200,
+    "required_before_promotion": true
+  },
+  "limits": {
+    "max_parameters": 12,
+    "max_candidate_runtime_seconds": 900,
+    "max_invalid_proposals_in_a_row": 20,
+    "max_duplicate_proposals_in_a_row": 20,
+    "max_source_edits": 0
+  },
+  "permissions": {
+    "allow_holdout": false,
+    "allow_deployment": false,
+    "allow_source_edits": false
+  }
+}
