@@ -17,7 +17,11 @@
 | **dead region** | a rule family or timeframe the repository has measured and killed; listed in `RESEARCH_PRIORS` and in every prompt |
 | **mechanism** | the required sentence saying why prices should behave as the rule assumes; the validator rejects a list of leaf names |
 | **config hash** | SHA-256 of the canonical configuration; the candidate id and the duplicate key |
-| **mission** | the JSON policy file; hashed at registration, re-checked at every start; a change is a new mission and a new ledger |
+| **mission** | the JSON policy file; hashed at registration, re-checked at every start; a change is a new mission id. v4 shares v2's ledger and evaluation protocol and finalizes the search policy |
+| **saturated** | a family with 30+ scored evaluations whose best did not move by 0.10 over its last 20; scheduled only as a drift check |
+| **near-duplicate** | a family proposal within 10% of every parameter's legal range of a tested configuration; rejected before any backtest |
+| **structural repeat** | a spec whose entry and exit leaf-type sets match a tested spec; rejected before any backtest |
+| **quota** | the target share of recorded candidates per mode (spec, family, calendar, control), measured over the last 100 |
 
 ## Candidate statuses (`candidates.status`)
 
@@ -65,6 +69,7 @@
 | `proposal_request_error` | an Ollama request failed or returned no content; retried |
 | `invalid_proposal` | a model response was rejected; the artifact is `invalid-<hash>.json` |
 | `duplicate_proposal` | a valid proposal matched an existing config hash |
+| `semantic_duplicate` | a valid proposal was a near-duplicate of a tested parameter set or repeated a tested spec structure |
 | `proposal_recorded` | a new candidate was stored |
 | `scheduled_creative_substitution`, `scheduled_feature_substitution` | the accepted proposal type differed from the scheduled focus in a permitted way |
 | `scheduled_strategy_failed` | three attempts at one focus failed |

@@ -1,15 +1,24 @@
+import json
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from supervisor import (
     DEFAULT_MISSION,
+    MIN_TREND_WINDOW,
+    is_saturated,
+    normalized_parameters,
+    parameter_distance,
+    parse_family_meta,
+    parse_sparams,
+    spec_signature,
     LEAF_SPEC,
     generator_prompts,
     parse_family_catalogue,
     proposal_schema,
     OllamaClient,
     Registry,
+    TraceLogger,
     classify_results,
     parse_family_specs,
     proposal_schema,
@@ -31,6 +40,39 @@ Registry strategies (searchable by 'tournament'):
 Available strategies:
   tsmom - legacy entry point
 """
+
+
+NEW_FORMAT_SAMPLE = """
+Registry strategies (searchable by 'tournament', tunable with --sparams):
+  ensemble_vote       majority vote
+                      enterVotes=2 [1..3], exitVotes=1 [0..2]
+  faber_ma            Faber (2007)
+                      window=200 [20..400], bandPct=0.0 [0.0..5.0]
+
+Available strategies:
+"""
+
+
+class FakeStreamingResponse:
+    def __init__(self, lines):
+        self.lines = [json.dumps(line).encode() + b"\n" for line in lines]
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        return False
+
+    def readline(self):
+        return self.lines.pop(0) if self.lines else b""
+
+
+class FakeStreamingOpener:
+    def __init__(self, response):
+        self.response = response
+
+    def open(self, request, timeout):
+        return self.response
 
 
 class SupervisorTests(unittest.TestCase):
@@ -98,9 +140,50 @@ class SupervisorTests(unittest.TestCase):
                 registry.close()
         self.assertGreater(failures["donchian"], 0.0)
 
+    def test_semantic_duplicates_penalize_focus_without_invalid_streak(self):
+        with TemporaryDirectory() as directory:
+            registry = Registry(Path(directory) / "research.sqlite3")
+            try:
+                registry.event(
+                    "semantic_duplicate",
+                    {"strategy": "donchian", "reason": "same mechanism"},
+                )
+                failures = registry.strategy_duplicate_failures()
+                self.assertGreater(failures["donchian"], 0.0)
+                self.assertEqual(registry.consecutive_event_streak("invalid_proposal"), 0)
+                registry.event("doctor_pass", {"mission_id": "test"})
+                registry.event("duplicate_proposal", {"strategy": "donchian"})
+                self.assertEqual(registry.consecutive_event_streak("duplicate_proposal"), 1)
+            finally:
+                registry.close()
+
     def test_non_loopback_ollama_is_rejected(self):
         with self.assertRaisesRegex(Exception, "loopback"):
             OllamaClient("http://example.com:11434", "qwen3-coder:latest")
+
+    def test_streamed_ollama_dialog_is_written_to_trace(self):
+        with TemporaryDirectory() as directory:
+            trace_path = Path(directory) / "trace.jsonl"
+            trace = TraceLogger(trace_path)
+            client = OllamaClient(
+                "http://127.0.0.1:11434",
+                "gpt-oss:20b",
+                min_interval=0,
+                trace=trace,
+            )
+            client.opener = FakeStreamingOpener(FakeStreamingResponse([
+                {"message": {"thinking": "reasoning ", "content": ""}, "done": False},
+                {"message": {"thinking": "briefly", "content": "{\"ok\":"}, "done": False},
+                {"message": {"content": "true}"}, "done": True, "eval_count": 2},
+            ]))
+            content, _ = client.chat("system", "user", {"type": "object"})
+            self.assertEqual(content, '{"ok":true}')
+            events = [json.loads(line) for line in trace_path.read_text().splitlines()]
+        names = [event["event"] for event in events]
+        self.assertIn("llm.request_start", names)
+        self.assertIn("llm.chunk", names)
+        self.assertIn("llm.request_end", names)
+        self.assertEqual("reasoning briefly", "".join(event["thinking"] for event in events if event["event"] == "llm.chunk"))
 
     def test_cloud_model_and_nonstandard_endpoint_are_rejected(self):
         with self.assertRaisesRegex(Exception, "cloud"):
@@ -274,6 +357,84 @@ class SupervisorTests(unittest.TestCase):
         proposal["mechanism"] = "market_zscore_above + vol_rank_above + breakout_above filtering"
         with self.assertRaisesRegex(Exception, "eight words of prose"):
             validate_proposal(proposal, self.mission, self.families)
+
+    def test_family_meta_reads_integer_marker_and_rounds(self):
+        meta = parse_family_meta(NEW_FORMAT_SAMPLE)
+        self.assertTrue(meta["ensemble_vote"]["enterVotes"]["is_int"])
+        self.assertFalse(meta["faber_ma"]["bandPct"]["is_int"])
+        self.assertFalse(meta["faber_ma"]["window"]["is_int"] is False and False)  # window is int
+        self.assertTrue(meta["faber_ma"]["window"]["is_int"])
+        family = {"enterVotes": (1.0, 3.0), "exitVotes": (0.0, 2.0)}
+        self.assertEqual(parse_sparams("enterVotes=2.5,exitVotes=0.75", family, meta["ensemble_vote"]), "enterVotes=3,exitVotes=1")
+        self.assertEqual(parse_sparams("enterVotes=2.5,exitVotes=0.75", family, None), "enterVotes=2.5,exitVotes=0.75")
+
+    def test_near_duplicate_distance(self):
+        meta = parse_family_meta(NEW_FORMAT_SAMPLE)["faber_ma"]
+        a = normalized_parameters("window=200,bandPct=1.0", meta)
+        b = normalized_parameters("window=210,bandPct=1.2", meta)     # 10/380 and 0.2/5 -> within 10%
+        c = normalized_parameters("window=300,bandPct=1.0", meta)     # 100/380 -> 26%
+        self.assertLess(parameter_distance(a, b), 0.10)
+        self.assertGreater(parameter_distance(a, c), 0.10)
+        self.assertEqual(normalized_parameters("", meta)["window"], (200 - 20) / 380)   # defaults filled in
+
+    def test_saturation_rule(self):
+        flat = [0.1] * 40
+        self.assertTrue(is_saturated(flat))
+        self.assertFalse(is_saturated(flat[:25]))                    # too few evaluations
+        improving = [0.1] * 30 + [0.1] * 9 + [0.5]                    # best moved by 0.4 inside the last 20
+        self.assertFalse(is_saturated(improving))
+
+    def test_spec_signature_ignores_numbers(self):
+        a = {"entry": {"all": [{"type": "close_above_sma", "window": 50}, {"type": "rsi_above", "window": 14, "threshold": 70}]},
+             "exit": {"type": "close_below_sma", "window": 20}}
+        b = {"entry": {"all": [{"type": "rsi_above", "window": 7, "threshold": 60}, {"type": "close_above_sma", "window": 120}]},
+             "exit": {"type": "close_below_sma", "window": 50}}
+        self.assertEqual(spec_signature(a), spec_signature(b))
+
+    def test_trend_window_floor(self):
+        proposal = self.proposal(strategy="generated_spec", sparams="")
+        proposal["proposal_type"] = "generated_spec"
+        proposal["spec"] = {"entry": {"type": "close_above_sma", "window": 6, "threshold": 0}, "exit": {"type": "red_candle"}}
+        with self.assertRaisesRegex(Exception, "fee-dead"):
+            validate_proposal(proposal, self.mission, self.families)
+        proposal["spec"] = {"entry": {"type": "rsi_above", "window": 5, "threshold": 70}, "exit": {"type": "red_candle"}}
+        validate_proposal(proposal, self.mission, self.families)      # RSI is not a trend leaf
+        schema = proposal_schema("generated_spec")
+        sma = next(l for l in schema["$defs"]["leaf"]["anyOf"] if l["properties"]["type"]["enum"] == ["close_above_sma"])
+        self.assertEqual(sma["properties"]["window"]["minimum"], MIN_TREND_WINDOW)
+
+    def test_prompt_states_plateau_and_novelty_rules(self):
+        incumbent = [{"sharpe": 0.09, "max_drawdown_pct": 19.0}, {"sharpe": 2.22, "max_drawdown_pct": 13.4}, {"sharpe": 0.29, "max_drawdown_pct": 15.0}]
+        system, user = generator_prompts("donchian", 1, "", self.mission, self.families, incumbent, [], [], {}, {}, None,
+                                         {"donchian": "Donchian rule"}, {"donchian": {"tested": 40, "best_vs_incumbent": 0.2}},
+                                         family_deltas=[0.1] * 40, saturated=frozenset({"donchian"}))
+        self.assertIn("THIS FAMILY'S RECORD: 40 evaluated", user)
+        self.assertIn("SATURATED", user)
+        self.assertIn("near-duplicate", user)
+        system, user = generator_prompts("generated_spec", 1, "", self.mission, self.families, incumbent, [], [], {"weekday": 5}, {}, None,
+                                         novelty_policy={"leaf_cap_share": 0.4})
+        self.assertIn("NOVELTY RULES", user)
+        self.assertIn(f"below {MIN_TREND_WINDOW} bars", user)
+
+    def test_zero_trade_report_parses_and_is_screened(self):
+        from supervisor import parse_metrics, classify_results
+        report = """===== Portfolio Report =====
+Total return:            0.00%       -74.72%       74.72%
+CAGR:                    0.00%       -49.79%       49.79%
+Sharpe (ann.):           0.00         -0.36         0.36
+  +/-                    0.71
+Sortino (ann.):          0.00         -0.51
+Max drawdown:            0.00%        88.94%   (close-to-close, see note)
+
+Avg pairwise sleeve correlation: nan
+--- per sleeve (each traded standalone, for reference) ---
+  BTC_USDT                   0.00     -0.02      0.02      0.0        0      25.0
+"""
+        metrics = parse_metrics(report)
+        self.assertEqual(metrics["trade_count"], 0)
+        self.assertIsNone(metrics["sleeve_correlation"])
+        summary = classify_results([metrics, metrics, metrics], None, None)
+        self.assertEqual(summary["classification"], "zero_trade_fold")
 
     def test_frontier_requires_incumbent_and_null_gates(self):
         candidate = [

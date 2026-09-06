@@ -1,0 +1,136 @@
+{
+  "mission_id": "local-trend-discovery-v3",
+  "description": "Same evaluation protocol as v2 (folds, universe, sizing, costs, gates). New search policy: the whole registry is in rotation, mode quotas replace least-tested allocation, saturated families leave the rotation, and near-duplicate parameter sets and structurally repeated specs are rejected before any backtest.",
+  "source_repo": "../cli_trader",
+  "data_policy": {
+    "development_end": "2023-12-31",
+    "holdout_start": "2024-01-01",
+    "allowed_data_dirs": [
+      "../cli_trader/data"
+    ],
+    "forbidden_paths": [
+      "../cli_trader/experiments/holdout.json",
+      "../cli_trader/state_live",
+      "../cli_trader/deploy"
+    ],
+    "allow_data_fetch": false
+  },
+  "allowed_commands": [
+    "portfolio",
+    "backtest",
+    "list-strategies",
+    "causality_check"
+  ],
+  "universe": {
+    "protocol_symbols": [
+      "BTC_USDT",
+      "ETH_USDT",
+      "XRP_USDT",
+      "LTC_USDT"
+    ],
+    "period_seconds": [
+      14400
+    ]
+  },
+  "evaluation": {
+    "folds": [
+      [
+        "2018-01-01",
+        "2019-12-31"
+      ],
+      [
+        "2020-01-01",
+        "2021-12-31"
+      ],
+      [
+        "2022-01-01",
+        "2023-12-31"
+      ]
+    ],
+    "warmup_bars": 600,
+    "vol_target": 0.2,
+    "vol_window": 30,
+    "weights": "equal",
+    "vol_lookback": 120,
+    "rebalance": 30,
+    "min_trades_per_fold": 1,
+    "max_trades_per_fold": 1000,
+    "primary_metric": "mean_excess_sharpe_vs_incumbent",
+    "required_metrics": [
+      "sharpe",
+      "excess_sharpe_vs_basket",
+      "excess_sharpe_vs_incumbent",
+      "worst_fold_excess",
+      "max_drawdown",
+      "sleeve_correlation",
+      "trades"
+    ]
+  },
+  "incumbent": {
+    "strategy": "ensemble_vote",
+    "sparams": "enterVotes=2,exitVotes=0",
+    "description": "Current research incumbent; not an automatic deployment recommendation."
+  },
+  "search_policy": {
+    "preferred_sequence": [
+      "generated_spec",
+      "feature_request",
+      "calendar_rule",
+      "faber_ma",
+      "sma_cross",
+      "tsmom",
+      "ensemble_vote",
+      "donchian",
+      "control_random",
+      "control_always_long"
+    ],
+    "schedule_feature_requests": false,
+    "exclude": [
+      "ensemble_ls"
+    ],
+    "quotas": {
+      "spec": 0.5,
+      "family": 0.4,
+      "calendar": 0.05,
+      "control": 0.05
+    },
+    "quota_window": 100,
+    "saturation": {
+      "min_evaluations": 30,
+      "window": 20,
+      "min_improvement": 0.1,
+      "drift_every": 20
+    },
+    "near_duplicate_distance": 0.1,
+    "spec_novelty": {
+      "leaf_cap_share": 0.4,
+      "leaf_cap_window": 30
+    },
+    "trend_window_floor_bars": 12,
+    "external_feature_policy": "proposal_only_until_a_local_feature_manifest_exists",
+    "notes": [
+      "preferred_sequence is only a tie-break order now; every family the binary lists is schedulable",
+      "quotas are measured over the last quota_window recorded candidates; the mode furthest below its share is scheduled",
+      "a family is saturated when >= min_evaluations were scored and the best over all did not beat the best before the last `window` by min_improvement; it then gets one drift check every drift_every candidates",
+      "near_duplicate_distance is the L-infinity distance between parameter vectors normalised to [0,1] over each legal range",
+      "measured 2026-09-06 on the v2 ledger: 151 tsmom parameter sets with best +0.27, indistinguishable from the best of 106 coin-flip controls (+0.26); 25 of 35 families never scheduled"
+    ]
+  },
+  "null_calibration": {
+    "strategy": "control_random",
+    "seeds": 200,
+    "required_before_promotion": true
+  },
+  "limits": {
+    "max_parameters": 12,
+    "max_candidate_runtime_seconds": 900,
+    "max_invalid_proposals_in_a_row": 20,
+    "max_duplicate_proposals_in_a_row": 20,
+    "max_source_edits": 0
+  },
+  "permissions": {
+    "allow_holdout": false,
+    "allow_deployment": false,
+    "allow_source_edits": false
+  }
+}

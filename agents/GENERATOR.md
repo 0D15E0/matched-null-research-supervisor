@@ -101,6 +101,21 @@ the scheduled family's parameter ranges and the parameter sets already tested
 for that family with their outcome. Use the ALREADY TESTED lists: repeating an
 entry there is rejected as a duplicate before any backtest runs.
 
+## Novelty rules the supervisor enforces
+
+These are checked before any backtest and returned as feedback when they fire:
+
+- a family proposal whose every parameter lies within 10% of its legal range
+  of a configuration already tested is a near-duplicate; integer parameters are
+  rounded first, so a fractional vote count is not a new configuration;
+- a spec whose entry and exit use exactly the same set of leaf types as a
+  tested spec is a structural repeat, whatever its numbers;
+- an entry leaf that appears in more than 40% of the last 30 specs is refused;
+- trend windows below 12 bars (two days) are refused as fee-dead.
+
+The prompt tells you each family's record (evaluated, best, median, whether it
+is saturated) so you can see a plateau instead of sweeping it.
+
 ## Prohibited output
 
 Never emit:

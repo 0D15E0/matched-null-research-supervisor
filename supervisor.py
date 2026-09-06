@@ -20,22 +20,25 @@ import os
 import re
 import signal
 import sqlite3
+import statistics
 import subprocess
 import sys
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from pathlib import Path
 from typing import Any, Iterator
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
-DEFAULT_MISSION = PROJECT_ROOT / "missions" / "local-trend-discovery-v2.json"
+DEFAULT_MISSION = PROJECT_ROOT / "missions" / "local-trend-discovery-v4.json"
 DEFAULT_DB = PROJECT_ROOT / "state" / "research-v2.sqlite3"
 DEFAULT_ARTIFACTS = PROJECT_ROOT / "artifacts-v2"
 DEFAULT_HEARTBEAT = PROJECT_ROOT / "state" / "heartbeat-v2.json"
-DEFAULT_CALIBRATION = PROJECT_ROOT / "state" / "null-calibration-v2.json"
+DEFAULT_CALIBRATION = PROJECT_ROOT / "state" / "null-calibration-v4.json"
+DEFAULT_TRACE = PROJECT_ROOT / "logs" / "trace-v4.jsonl"
 DEFAULT_MODEL = "gpt-oss:20b"
 # Context window for every Ollama call. The generator prompt runs 6.9k tokens
 # at the median and 7.9k at the maximum (measured 2026-09-05 on 44 recorded
@@ -122,6 +125,58 @@ def write_json(path: Path, value: Any) -> None:
     temporary = path.with_name(path.name + ".tmp")
     temporary.write_text(json.dumps(value, indent=2) + "\n")
     os.replace(temporary, path)
+
+
+class TraceLogger:
+    """Append-only local trace for model dialogue and evaluator boundaries."""
+
+    def __init__(self, path: Path | None = DEFAULT_TRACE, console: bool = False) -> None:
+        self.path = None if path is None else path.resolve()
+        self.console = console
+
+    def emit(self, event: str, **fields: Any) -> None:
+        record = {"timestamp": utc_now(), "event": event, **fields}
+        try:
+            line = json.dumps(record, sort_keys=True, ensure_ascii=True, allow_nan=False, default=str)
+        except (TypeError, ValueError) as error:
+            record = {
+                "timestamp": utc_now(),
+                "event": "trace.serialization_error",
+                "original_event": event,
+                "error": str(error),
+            }
+            line = json.dumps(record, sort_keys=True, ensure_ascii=True)
+        if self.path is not None:
+            try:
+                self.path.parent.mkdir(parents=True, exist_ok=True)
+                with self.path.open("a", encoding="utf-8") as stream:
+                    stream.write(line + "\n")
+                    stream.flush()
+            except OSError:
+                # Tracing must never change the research result or stop the daemon.
+                pass
+        if self.console:
+            self._print_console(event, fields, line)
+
+    @staticmethod
+    def _print_console(event: str, fields: dict[str, Any], line: str) -> None:
+        if event == "llm.chunk":
+            text = fields.get("thinking") or fields.get("content") or ""
+            if text:
+                channel = "thinking" if fields.get("thinking") else "content"
+                print(f"[trace:{channel}] {text}", end="", file=sys.stderr, flush=True)
+            if fields.get("done"):
+                print(file=sys.stderr, flush=True)
+            return
+        if event == "llm.request_start":
+            print(
+                f"\n[trace] {fields.get('role', 'model')} request "
+                f"{fields.get('request_id', '-')}: prompt={fields.get('user_chars', 0)} chars",
+                file=sys.stderr,
+                flush=True,
+            )
+            return
+        print(f"[trace] {line}", file=sys.stderr, flush=True)
 
 
 def percentile(values: list[float], probability: float) -> float:
@@ -300,6 +355,71 @@ def parse_family_specs(output: str) -> dict[str, dict[str, tuple[float, float]]]
     return families
 
 
+def parse_family_meta(output: str) -> dict[str, dict[str, dict[str, Any]]]:
+    """name -> {param: {lo, hi, default, is_int}} from `list-strategies`.
+
+    Integer-ness is read from the text: the registry prints integer parameters
+    without a decimal point and real ones always with one (main.cpp,
+    cmdListStrategies). The registry ROUNDS integer parameters before running a
+    strategy, so enterVotes=2.5 executes as enterVotes=3; canonicalising with
+    the same rounding makes the two hash alike and stops a fractional vote count
+    from passing the duplicate detector as a "new" configuration.
+    """
+    meta: dict[str, dict[str, dict[str, Any]]] = {}
+    current: str | None = None
+    block: list[str] = []
+
+    def flush() -> None:
+        if current is None:
+            return
+        text = "".join(block)
+        meta[current] = {}
+        for m in PARAM.finditer(text):
+            tokens = (m.group(2), m.group(3), m.group(4))
+            is_int = all("." not in t and "e" not in t.lower() for t in tokens)
+            meta[current][m.group(1)] = {
+                "lo": float(m.group(3)), "hi": float(m.group(4)),
+                "default": float(m.group(2)), "is_int": is_int,
+            }
+
+    for line in output.splitlines():
+        if line.startswith("Available strategies:"):
+            flush()
+            break
+        match = FAMILY_LINE.match(line)
+        if match:
+            flush()
+            current = match.group(1)
+            block = [line]
+            continue
+        if current is None:
+            continue
+        block.append(line)
+    flush()
+    return meta
+
+
+def normalized_parameters(sparams: str, meta: dict[str, dict[str, Any]]) -> dict[str, float]:
+    """Every parameter of the family scaled to [0,1] over its legal range, defaults filled in."""
+    values = {name: float(m["default"]) for name, m in meta.items()}
+    for piece in sparams.split(","):
+        piece = piece.strip()
+        if "=" in piece:
+            name, text = piece.split("=", 1)
+            if name in values:
+                values[name] = float(text)
+    out = {}
+    for name, m in meta.items():
+        span = float(m["hi"]) - float(m["lo"])
+        out[name] = (values[name] - float(m["lo"])) / span if span > 0 else 0.0
+    return out
+
+
+def parameter_distance(a: dict[str, float], b: dict[str, float]) -> float:
+    """L-infinity distance between two normalised parameter vectors."""
+    return max((abs(a[k] - b.get(k, 0.0)) for k in a), default=0.0)
+
+
 def parse_family_catalogue(output: str) -> dict[str, str]:
     """name -> one-line provenance, from the same `list-strategies` text parse_family_specs reads.
 
@@ -318,7 +438,8 @@ def parse_family_catalogue(output: str) -> dict[str, str]:
     return catalogue
 
 
-def parse_sparams(raw: str, family: dict[str, tuple[float, float]]) -> str:
+def parse_sparams(raw: str, family: dict[str, tuple[float, float]],
+                  meta: dict[str, dict[str, Any]] | None = None) -> str:
     if not isinstance(raw, str):
         raise SupervisorError("sparams must be a string")
     if not raw:
@@ -339,6 +460,11 @@ def parse_sparams(raw: str, family: dict[str, tuple[float, float]]) -> str:
         lo, hi = family[name]
         if value < lo or value > hi:
             raise SupervisorError(f"{name}={value_text} outside [{lo}, {hi}]")
+        if meta and meta.get(name, {}).get("is_int"):
+            # Mirror std::lround in registry.h (half away from zero); Python's
+            # round() is half-to-even and would turn 2.5 into 2 where the
+            # executor runs 3.
+            value = math.copysign(math.floor(abs(value) + 0.5), value)
         parsed[name] = value
     def sort_key(item: tuple[str, float]) -> str:
         return item[0]
@@ -426,7 +552,7 @@ def spec_rule_defs() -> dict[str, Any]:
         props: dict[str, Any] = {"type": {"type": "string", "enum": [name]}}
         for field in spec["fields"]:
             if field == "window":
-                props["window"] = {"type": "integer", "minimum": 2, "maximum": 600}
+                props["window"] = {"type": "integer", "minimum": MIN_TREND_WINDOW if name in TREND_LEAVES else 2, "maximum": 600}
             elif field == "threshold":
                 lo, hi = spec["range"]
                 props["threshold"] = {"type": "number", "minimum": lo, "maximum": hi}
@@ -479,7 +605,10 @@ def generator_prompts(focus: str, attempt: int, feedback: str, mission: dict[str
                       counts: dict[str, int],
                       calibration: dict[str, Any] | None,
                       catalogue: dict[str, str] | None = None,
-                      family_outcomes: dict[str, dict[str, Any]] | None = None) -> tuple[str, str]:
+                      family_outcomes: dict[str, dict[str, Any]] | None = None,
+                      family_deltas: list[float] | None = None,
+                      saturated: set[str] | frozenset[str] | None = None,
+                      novelty_policy: dict[str, Any] | None = None) -> tuple[str, str]:
     """Build (system, user) for one generator call. Pure: everything it says comes from its arguments.
 
     What the model is told, and why:
@@ -529,7 +658,8 @@ def generator_prompts(focus: str, attempt: int, feedback: str, mission: dict[str
             outcome = (family_outcomes or {}).get(name)
             if outcome and outcome.get("tested"):
                 best = outcome.get("best_vs_incumbent")
-                tag = f" [tested {outcome['tested']}x" + (f", best {best:+.2f} vs incumbent]" if best is not None else "]")
+                tag = f" [tested {outcome['tested']}x" + (f", best {best:+.2f} vs incumbent" if best is not None else "") \
+                      + (", SATURATED: its best stopped moving" if saturated and name in saturated else "") + "]"
             else:
                 tag = " [untested here]"
             lines.append(f"- {name}: {provenance[:110]}{tag}")
@@ -560,6 +690,13 @@ def generator_prompts(focus: str, attempt: int, feedback: str, mission: dict[str
         if over:
             body.append(f"OVER-USED so far (avoid building yet another rule around these): {', '.join(over)}."
                         + (f" NEVER USED yet: {', '.join(under)}." if under else ""))
+        cap = (novelty_policy or {}).get("leaf_cap_share", 0.4)
+        body.append(
+            "NOVELTY RULES, enforced before any backtest: a spec whose entry and exit use exactly the same SET of leaf "
+            "types as a tested spec is rejected as a repeat, whatever its numbers; an entry leaf that already appears in "
+            f"more than {cap:.0%} of recent specs is rejected; trend windows below {MIN_TREND_WINDOW} bars (two days) are "
+            "rejected as fee-dead. A new spec must combine leaves that have not been combined before."
+        )
         if recent_specs:
             body.append("ALREADY TESTED (entry -> exit; outcome; mean Sharpe vs incumbent):")
             for item in recent_specs:
@@ -583,6 +720,18 @@ def generator_prompts(focus: str, attempt: int, feedback: str, mission: dict[str
                         "setting that expresses a different regime or horizon and say why.")
         else:
             body.append("This family has no tunable parameters: sparams must be the empty string exactly.")
+        if family_deltas:
+            best = max(family_deltas)
+            improved = best - max(family_deltas[:-20]) if len(family_deltas) > 20 else None
+            body.append(
+                f"THIS FAMILY'S RECORD: {len(family_deltas)} evaluated, best {best:+.2f}, median "
+                f"{statistics.median(family_deltas):+.2f} vs the incumbent"
+                + (f"; the last 20 evaluations moved the best by {improved:+.2f}" if improved is not None else "")
+                + (". This family is SATURATED: only a setting that expresses a different horizon or regime is worth running."
+                   if saturated and focus in saturated else ".")
+            )
+            body.append("A proposal whose every parameter lies within 10% of its legal range from a tested configuration is "
+                        "rejected as a near-duplicate before any backtest.")
         if recent_sparams:
             body.append("ALREADY TESTED for this family (sparams; outcome; mean Sharpe vs incumbent):")
             for item in recent_sparams:
@@ -596,7 +745,8 @@ def generator_prompts(focus: str, attempt: int, feedback: str, mission: dict[str
 class OllamaClient:
     def __init__(self, endpoint: str, model: str, timeout: float = 180.0,
                  min_interval: float = DEFAULT_OLLAMA_MIN_INTERVAL,
-                 num_ctx: int = DEFAULT_NUM_CTX, think: str | None = None) -> None:
+                 num_ctx: int = DEFAULT_NUM_CTX, think: str | None = None,
+                 trace: TraceLogger | None = None, role: str = "generator") -> None:
         parsed = urllib.parse.urlparse(endpoint)
         try:
             port = parsed.port
@@ -615,6 +765,8 @@ class OllamaClient:
         self.timeout = timeout
         self.num_ctx = int(num_ctx)
         self.think = think          # None = leave the model's default; "low"/"medium"/"high" for thinking models
+        self.trace = trace
+        self.role = role
         self.min_interval = max(0.0, float(min_interval))
         self.next_request_at = 0.0
         self.failure_streak = 0
@@ -656,27 +808,148 @@ class OllamaClient:
             raise SupervisorError(f"Ollama error: {value['error']}")
         return value
 
+    def _stream_request(self, path: str, payload: dict[str, Any], request_id: str) -> dict[str, Any]:
+        wait = self.next_request_at - time.monotonic()
+        if wait > 0.0:
+            time.sleep(wait)
+        self.next_request_at = time.monotonic() + self.min_interval
+        data = json.dumps(payload).encode()
+        request = urllib.request.Request(
+            self.endpoint + path,
+            data=data,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        content_chunks: list[str] = []
+        thinking_chunks: list[str] = []
+        final_response: dict[str, Any] = {}
+        total_bytes = 0
+        try:
+            with self.opener.open(request, timeout=self.timeout) as response:
+                while True:
+                    raw_line = response.readline()
+                    if not raw_line:
+                        break
+                    total_bytes += len(raw_line)
+                    if total_bytes > MAX_RESPONSE_BYTES:
+                        raise SupervisorError("Ollama response exceeded the local response limit")
+                    if isinstance(raw_line, bytes):
+                        raw_line = raw_line.decode("utf-8")
+                    line = raw_line.strip()
+                    if not line:
+                        continue
+                    try:
+                        value = json.loads(line)
+                    except json.JSONDecodeError as error:
+                        raise SupervisorError("Ollama returned invalid streaming JSON") from error
+                    if not isinstance(value, dict):
+                        raise SupervisorError("Ollama streaming response was not an object")
+                    if value.get("error"):
+                        raise SupervisorError(f"Ollama error: {value['error']}")
+                    final_response = value
+                    message = value.get("message", {})
+                    content = message.get("content") if isinstance(message, dict) else None
+                    thinking = message.get("thinking") if isinstance(message, dict) else None
+                    if isinstance(content, str) and content:
+                        content_chunks.append(content)
+                    if isinstance(thinking, str) and thinking:
+                        thinking_chunks.append(thinking)
+                    if self.trace is not None:
+                        self.trace.emit(
+                            "llm.chunk",
+                            request_id=request_id,
+                            role=self.role,
+                            content=content or "",
+                            thinking=thinking or "",
+                            done=bool(value.get("done")),
+                        )
+        except (urllib.error.URLError, TimeoutError) as error:
+            self.failure_streak += 1
+            backoff = min(60.0, float(2 ** min(self.failure_streak, 6)))
+            self.next_request_at = max(self.next_request_at, time.monotonic() + backoff)
+            raise SupervisorError(f"local Ollama request failed: {error}") from error
+        self.failure_streak = 0
+        final_response["message"] = {
+            "role": "assistant",
+            "content": "".join(content_chunks),
+        }
+        if thinking_chunks:
+            final_response["message"]["thinking"] = "".join(thinking_chunks)
+        return final_response
+
     def tags(self) -> list[str]:
         value = self._request("/api/tags")
         models = value.get("models", [])
         return [str(item.get("name")) for item in models if isinstance(item, dict) and item.get("name")]
 
-    def chat(self, system: str, user: str, format_schema: dict[str, Any] | None = None) -> tuple[str, dict[str, Any]]:
+    def chat(self, system: str, user: str, format_schema: dict[str, Any] | None = None,
+             trace_context: dict[str, Any] | None = None) -> tuple[str, dict[str, Any]]:
+        request_id = uuid.uuid4().hex
+        schema = format_schema or proposal_schema()
         payload = {
             "model": self.model,
             "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
-            "stream": False,
-            "format": format_schema or proposal_schema(),
+            "stream": True,
+            "format": schema,
             "options": {"temperature": 0.7, "num_ctx": self.num_ctx},
             "keep_alive": "10m",
         }
         if self.think is not None:
             payload["think"] = self.think
-        response = self._request("/api/chat", payload)
+        context = trace_context or {}
+        if self.trace is not None:
+            self.trace.emit(
+                "llm.request_start",
+                request_id=request_id,
+                role=self.role,
+                model=self.model,
+                endpoint=self.endpoint,
+                system=system,
+                user=user,
+                schema=schema,
+                **context,
+            )
+        started = time.monotonic()
+        try:
+            response = self._stream_request("/api/chat", payload, request_id)
+        except SupervisorError as error:
+            if self.trace is not None:
+                self.trace.emit(
+                    "llm.request_error",
+                    request_id=request_id,
+                    role=self.role,
+                    model=self.model,
+                    error=str(error),
+                    duration_seconds=time.monotonic() - started,
+                    **context,
+                )
+            raise
         message = response.get("message", {})
         content = message.get("content") if isinstance(message, dict) else None
         if not isinstance(content, str) or not content.strip():
+            if self.trace is not None:
+                self.trace.emit(
+                    "llm.request_error",
+                    request_id=request_id,
+                    role=self.role,
+                    model=self.model,
+                    error="Ollama returned no proposal content",
+                    duration_seconds=time.monotonic() - started,
+                    **context,
+                )
             raise SupervisorError("Ollama returned no proposal content")
+        if self.trace is not None:
+            self.trace.emit(
+                "llm.request_end",
+                request_id=request_id,
+                role=self.role,
+                model=self.model,
+                content_chars=len(content),
+                thinking_chars=len(message.get("thinking", "")) if isinstance(message, dict) else 0,
+                duration_seconds=time.monotonic() - started,
+                metadata={key: value for key, value in response.items() if key != "message"},
+                **context,
+            )
         return content, response
 
 
@@ -917,7 +1190,8 @@ class Registry:
         now = dt.datetime.now(dt.timezone.utc)
         for row in self.db.execute(
             "SELECT candidate_id, payload_json, created_at FROM events "
-            "WHERE event_type='duplicate_proposal' ORDER BY event_id DESC LIMIT 200"
+            "WHERE event_type IN ('duplicate_proposal', 'semantic_duplicate') "
+            "ORDER BY event_id DESC LIMIT 200"
         ):
             try:
                 payload = json.loads(row["payload_json"])
@@ -987,6 +1261,57 @@ class Registry:
                         "sharpe_vs_incumbent": delta})
             if len(out) >= limit:
                 break
+        return out
+
+    def family_deltas(self) -> dict[str, list[float]]:
+        """Per strategy, mean Sharpe vs incumbent of every scored candidate, in evaluation order."""
+        out: dict[str, list[float]] = {}
+        for row in self.db.execute("SELECT proposal_json, summary_json FROM candidates WHERE summary_json IS NOT NULL ORDER BY created_at"):
+            try:
+                strategy = json.loads(row["proposal_json"]).get("strategy")
+                delta = json.loads(row["summary_json"]).get("mean_excess_sharpe_vs_incumbent")
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if isinstance(strategy, str) and isinstance(delta, (int, float)):
+                out.setdefault(strategy, []).append(float(delta))
+        return out
+
+    def tested_family_configs(self, strategy: str) -> list[tuple[str, str]]:
+        """(candidate_id, sparams) of every recorded candidate of one family."""
+        out = []
+        for row in self.db.execute("SELECT candidate_id, proposal_json FROM candidates"):
+            try:
+                proposal = json.loads(row["proposal_json"])
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if proposal.get("strategy") == strategy:
+                out.append((row["candidate_id"], proposal.get("sparams", "") or ""))
+        return out
+
+    def recent_strategies(self, limit: int = 100) -> list[str]:
+        """Strategy names of the most recent recorded candidates, newest first."""
+        out = []
+        for (proposal_json,) in self.db.execute("SELECT proposal_json FROM candidates ORDER BY created_at DESC LIMIT ?", (limit,)):
+            try:
+                strategy = json.loads(proposal_json).get("strategy")
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if isinstance(strategy, str):
+                out.append(strategy)
+        return out
+
+    def recent_specs(self, limit: int = 30) -> list[dict[str, Any]]:
+        """The rule trees of the most recent generated specs, newest first."""
+        out = []
+        for (proposal_json,) in self.db.execute("SELECT proposal_json FROM candidates ORDER BY created_at DESC LIMIT 2000"):
+            try:
+                proposal = json.loads(proposal_json)
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if proposal.get("spec"):
+                out.append(proposal["spec"])
+                if len(out) >= limit:
+                    break
         return out
 
     def family_outcomes(self) -> dict[str, dict[str, Any]]:
@@ -1061,13 +1386,17 @@ class Registry:
         self.db.commit()
         return True
 
-    def consecutive_event_streak(self, event_type: str, reset_type: str = "proposal_recorded") -> int:
+    def consecutive_event_streak(
+        self,
+        event_type: str,
+        reset_types: tuple[str, ...] = ("proposal_recorded", "doctor_pass"),
+    ) -> int:
         rows = self.db.execute(
             "SELECT event_type FROM events ORDER BY event_id DESC LIMIT 10000"
         )
         streak = 0
         for row in rows:
-            if row["event_type"] == reset_type:
+            if row["event_type"] in reset_types:
                 break
             if row["event_type"] == event_type:
                 streak += 1
@@ -1151,6 +1480,52 @@ LEAF_SPEC: dict[str, dict[str, Any]] = {
 }
 SPEC_LEAVES = set(LEAF_SPEC)
 SECONDARY_WINDOW_RANGE = {"vol_window": (2, 600), "rank_window": (20, 2000)}
+# Leaves that measure a trend or a channel. Below two days of 4h bars they
+# describe noise and the fee model kills them: 87% of the first day's generated
+# specs died, and the losers were dominated by 6-12 bar windows. The floor is a
+# design choice, enforced in the schema (the model cannot emit it) and here.
+TREND_LEAVES = {
+    "close_above_sma", "close_below_sma", "close_above_ema", "close_below_ema",
+    "breakout_above", "breakdown_below", "return_above", "return_below",
+    "zscore_return_above", "zscore_return_below", "market_zscore_above", "market_zscore_below",
+}
+MIN_TREND_WINDOW = 12
+
+
+def spec_leaf_types(node: Any) -> list[str]:
+    out: list[str] = []
+    if isinstance(node, dict):
+        if isinstance(node.get("type"), str):
+            out.append(node["type"])
+        for value in node.values():
+            out.extend(spec_leaf_types(value))
+    elif isinstance(node, list):
+        for value in node:
+            out.extend(spec_leaf_types(value))
+    return out
+
+
+def spec_signature(spec: dict[str, Any]) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """(sorted entry leaf types, sorted exit leaf types): the rule's structure, ignoring numbers.
+
+    Two specs with the same signature test the same mechanism with different
+    digits; the second is a parameter sweep, not a new hypothesis.
+    """
+    return (tuple(sorted(spec_leaf_types(spec.get("entry")))), tuple(sorted(spec_leaf_types(spec.get("exit")))))
+
+
+def is_saturated(deltas: list[float], min_evaluations: int = 30, window: int = 20,
+                 min_improvement: float = 0.10) -> bool:
+    """A family is saturated when many evaluations have stopped moving its best result.
+
+    deltas are mean Sharpe vs the incumbent in evaluation order. Saturated means
+    at least `min_evaluations`, and the best over all of them exceeds the best
+    before the last `window` by less than `min_improvement`. tsmom reached this
+    at about its 30th evaluation on 2026-09-05 and then ran 120 more.
+    """
+    if len(deltas) < max(min_evaluations, window + 1):
+        return False
+    return max(deltas) - max(deltas[:-window]) < min_improvement
 
 
 def normalize_spec_node(value: Any, depth: int = 0) -> dict[str, Any]:
@@ -1230,8 +1605,10 @@ def validate_spec_node(value: Any, depth: int = 0) -> int:
             raise SupervisorError("generated spec weekday day must be an integer from 0 to 6")
     if "window" in spec["fields"]:
         window = value.get("window")
-        if isinstance(window, bool) or not isinstance(window, int) or not 2 <= window <= 600:
-            raise SupervisorError("generated spec window must be an integer from 2 to 600")
+        floor = MIN_TREND_WINDOW if leaf in TREND_LEAVES else 2
+        if isinstance(window, bool) or not isinstance(window, int) or not floor <= window <= 600:
+            raise SupervisorError(f"generated spec {leaf} window must be an integer from {floor} to 600"
+                                  + (" (two days of 4h bars; shorter trend windows are fee-dead)" if floor > 2 else ""))
     if spec["range"] is not None:
         threshold = numeric(value["threshold"], "generated spec threshold")
         lo, hi = spec["range"]
@@ -1291,7 +1668,8 @@ def validate_feature_request(value: Any) -> dict[str, Any]:
     }))
 
 
-def validate_proposal(raw: dict[str, Any], mission: dict[str, Any], families: dict[str, dict[str, tuple[float, float]]]) -> dict[str, Any]:
+def validate_proposal(raw: dict[str, Any], mission: dict[str, Any], families: dict[str, dict[str, tuple[float, float]]],
+                      family_meta: dict[str, dict[str, dict[str, Any]]] | None = None) -> dict[str, Any]:
     required = {
         "hypothesis", "strategy", "sparams", "vol_target", "weights", "vol_lookback",
         "rebalance", "mechanism", "reasoning", "expected_failure_mode", "novelty_key",
@@ -1337,7 +1715,7 @@ def validate_proposal(raw: dict[str, Any], mission: dict[str, Any], families: di
     else:
         if not isinstance(strategy, str) or strategy not in families:
             raise SupervisorError(f"strategy is not in the live CLI registry: {strategy!r}")
-        sparams = parse_sparams(raw["sparams"], families[strategy])
+        sparams = parse_sparams(raw["sparams"], families[strategy], (family_meta or {}).get(strategy))
         parameter_count = len(sparams.split(",")) if sparams else 0
     if parameter_count > int(mission["limits"]["max_parameters"]):
         raise SupervisorError("proposal exceeds the mission parameter limit")
@@ -1392,11 +1770,11 @@ def validate_proposal(raw: dict[str, Any], mission: dict[str, Any], families: di
 
 
 def parse_metrics(output: str) -> dict[str, Any]:
-    def find(pattern: str, field: str) -> float:
+    def find(pattern: str, field: str) -> float | None:
         match = re.search(pattern, output, re.MULTILINE)
         if not match:
             raise SupervisorError(f"portfolio output missing {field}")
-        return float(match.group(1))
+        return None if match.group(1) == "nan" else float(match.group(1))
     metrics = {
         "total_return_pct": find(r"^Total return:\s+([-+0-9.]+)%", "total return"),
         "cagr_pct": find(r"^CAGR:\s+([-+0-9.]+)%", "CAGR"),
@@ -1404,7 +1782,10 @@ def parse_metrics(output: str) -> dict[str, Any]:
         "excess_sharpe_vs_basket": find(r"^Sharpe \(ann\.\):\s+[-+0-9.]+\s+[-+0-9.]+\s+([-+0-9.]+)", "excess Sharpe"),
         "sortino": find(r"^Sortino \(ann\.\):\s+([-+0-9.]+)", "Sortino"),
         "max_drawdown_pct": find(r"^Max drawdown:\s+([-+0-9.]+)%", "max drawdown"),
-        "sleeve_correlation": find(r"^Avg pairwise sleeve correlation:\s+([-+0-9.]+)", "sleeve correlation"),
+        # A spec that never trades prints `nan` here (zero-variance sleeve returns).
+        # Read it as NaN so the zero-trade screen can label the candidate, instead
+        # of failing the parse and mislabelling it as an execution failure.
+        "sleeve_correlation": find(r"^Avg pairwise sleeve correlation:\s+([-+0-9.]+|nan)", "sleeve correlation"),
     }
     trade_values = re.findall(r"^\s+[A-Z0-9_]+\s+[-+0-9.]+\s+[-+0-9.]+\s+[-+0-9.]+\s+[-+0-9.]+\s+(\d+)\s+[-+0-9.]+\s*$", output, re.MULTILINE)
     metrics["trade_count"] = sum(int(value) for value in trade_values)
@@ -1419,7 +1800,9 @@ class Supervisor:
                  ollama_min_interval: float = DEFAULT_OLLAMA_MIN_INTERVAL,
                  reviewer_model: str = DEFAULT_REVIEWER_MODEL,
                  num_ctx: int = DEFAULT_NUM_CTX,
-                 generator_think: str | None = DEFAULT_GENERATOR_THINK) -> None:
+                 generator_think: str | None = DEFAULT_GENERATOR_THINK,
+                 trace_path: Path | None = DEFAULT_TRACE,
+                 trace_console: bool = False) -> None:
         self.mission_path = mission_path.resolve()
         self.mission = validate_mission(self.mission_path)
         self.mission_hash = sha256_file(self.mission_path)
@@ -1431,10 +1814,13 @@ class Supervisor:
         self.source_revision = git_revision(self.repo)
         self.model = model
         self.reviewer_model = reviewer_model
+        self.trace = TraceLogger(trace_path, trace_console)
         self.client = OllamaClient(endpoint, model, timeout, ollama_min_interval,
-                                   num_ctx=num_ctx, think=generator_think)
+                       num_ctx=num_ctx, think=generator_think,
+                       trace=self.trace, role="generator")
         self.reviewer_client = OllamaClient(endpoint, reviewer_model, timeout, ollama_min_interval,
-                                            num_ctx=num_ctx, think=None)
+                            num_ctx=num_ctx, think=None,
+                            trace=self.trace, role="reviewer")
         self.db = Registry(db_path)
         self.artifacts = artifacts
         self.heartbeat_path = heartbeat_path
@@ -1445,6 +1831,7 @@ class Supervisor:
         self.recover_inflight_candidates()
         self.families = self.discover_families()
         self.catalogue = self.discover_catalogue()
+        self.family_meta = self.discover_family_meta()
         self.reconcile_proposals()
         self.seed_best_history()
 
@@ -1509,6 +1896,21 @@ class Supervisor:
             "reviewer_model": self.reviewer_model,
             "updated_at": utc_now(),
         })
+        self.trace.emit(
+            "heartbeat",
+            status=status,
+            iteration=iteration,
+            candidate_id=candidate_id,
+            error=error,
+            focus=focus,
+        )
+
+    def discover_family_meta(self) -> dict[str, dict[str, dict[str, Any]]]:
+        completed = subprocess.run(
+            [str(self.binary), "list-strategies"], cwd=self.repo, text=True,
+            capture_output=True, timeout=30, check=False, env=safe_child_environment(),
+        )
+        return parse_family_meta(completed.stdout) if completed.returncode == 0 else {}
 
     def discover_catalogue(self) -> dict[str, str]:
         completed = subprocess.run(
@@ -1531,7 +1933,7 @@ class Supervisor:
             try:
                 raw = json.loads(row["proposal_json"])
                 raw.setdefault("proposal_type", "family")
-                validate_proposal(raw, self.mission, self.families)
+                validate_proposal(raw, self.mission, self.families, self.family_meta)
             except SupervisorError as error:
                 self.db.update_candidate(row["candidate_id"], "invalid", "registry_revalidation_failed", {"error": str(error)})
                 self.db.event("proposal_revalidated_invalid", {"error": str(error)}, row["candidate_id"])
@@ -1568,34 +1970,88 @@ class Supervisor:
         self.db.event("doctor_pass", result)
         return result
 
+    @staticmethod
+    def mode_of(name: str) -> str:
+        if name == "generated_spec":
+            return "spec"
+        if name.startswith("control_"):
+            return "control"
+        if name == "calendar_rule":
+            return "calendar"
+        return "family"
+
+    def search_policy(self) -> dict[str, Any]:
+        policy = dict(self.mission.get("search_policy", {}))
+        policy.setdefault("quotas", {"spec": 0.5, "family": 0.4, "calendar": 0.05, "control": 0.05})
+        policy.setdefault("quota_window", 100)
+        policy.setdefault("exclude", [])
+        policy.setdefault("saturation", {"min_evaluations": 30, "window": 20, "min_improvement": 0.10, "drift_every": 20})
+        policy.setdefault("near_duplicate_distance", 0.10)
+        policy.setdefault("spec_novelty", {"leaf_cap_share": 0.40, "leaf_cap_window": 30})
+        return policy
+
+    def saturation(self) -> dict[str, bool]:
+        sat = self.search_policy()["saturation"]
+        deltas = self.db.family_deltas()
+        return {
+            name: is_saturated(deltas.get(name, []), int(sat["min_evaluations"]), int(sat["window"]), float(sat["min_improvement"]))
+            for name in self.families
+        }
+
     def state_context(self) -> dict[str, Any]:
         strategy_counts = self.db.strategy_counts()
         focus_failures = self.db.strategy_focus_failures()
         duplicate_failures = self.db.strategy_duplicate_failures()
-        focus_order = self.mission.get("search_policy", {}).get("preferred_sequence", [])
-        schedule_features = bool(self.mission.get("search_policy", {}).get("schedule_feature_requests", False))
-        candidates = [
-            name for name in focus_order
-            if (name in self.families or name == "generated_spec") and
-            (schedule_features or name != "feature_request")
-        ]
-        if not candidates:
-            candidates = ["generated_spec"]
-        # No collapse rule here. Failure counts decay exponentially and never
-        # reach zero, so "every family has failed at least once" became true
-        # for good at 19:34 on 2026-09-05 and every later iteration was routed
-        # to generated_spec. A fresh failure now costs a family roughly ten
-        # candidates' worth of priority and fades over a day.
+        policy = self.search_policy()
+        schedule_features = bool(policy.get("schedule_feature_requests", False))
+        exclude = set(policy["exclude"]) | ({"feature_request"} if not schedule_features else set())
+        preferred = list(policy.get("preferred_sequence", []))
+        # THE WHOLE REGISTRY is in rotation, not a hand-typed list: the v2
+        # mission named ten modes and 25 of 35 families were never scheduled in
+        # 705 evaluations while tsmom was scheduled 151 times.
+        pool = [name for name in list(self.families) + ["generated_spec"] if name not in exclude]
+        saturated = self.saturation()
         FAILURE_WEIGHT = 10.0
-        target = min(
-            candidates,
-            key=lambda name: (
+
+        def score(name: str) -> tuple[float, int]:
+            return (
                 strategy_counts.get(name, 0)
                 + FAILURE_WEIGHT * focus_failures.get(name, 0)
                 + FAILURE_WEIGHT * duplicate_failures.get(name, 0),
-                candidates.index(name),
-            ),
-        )
+                preferred.index(name) if name in preferred else len(preferred),
+            )
+
+        # QUOTAS by mode, measured over the recent window. Least-tested alone
+        # is uniform allocation: it gave coin-flip controls 15% of the first
+        # night's budget after the null had already been calibrated.
+        recent = self.db.recent_strategies(int(policy["quota_window"]))
+        realized: dict[str, int] = {}
+        for name in recent:
+            realized[self.mode_of(name)] = realized.get(self.mode_of(name), 0) + 1
+        total_recent = max(1, len(recent))
+        quotas = policy["quotas"]
+        deficit = {mode: float(share) - realized.get(mode, 0) / total_recent for mode, share in quotas.items()}
+
+        # SATURATION: a family whose best has stopped moving leaves the rotation
+        # except for one drift check every `drift_every` recorded candidates.
+        total_recorded = sum(strategy_counts.values())
+        drift_every = int(policy["saturation"]["drift_every"])
+        saturated_pool = [name for name in pool if saturated.get(name)]
+        target = None
+        reason = ""
+        if saturated_pool and drift_every > 0 and total_recorded % drift_every == 0:
+            target = min(saturated_pool, key=score)
+            reason = "drift check of a saturated family"
+        else:
+            for mode in sorted(deficit, key=deficit.get, reverse=True):
+                members = [name for name in pool if self.mode_of(name) == mode and not saturated.get(name)]
+                if members:
+                    target = min(members, key=score)
+                    reason = f"mode {mode} is {deficit[mode]:+.0%} below its quota"
+                    break
+        if target is None:
+            target = "generated_spec"
+            reason = "every family saturated"
         calibration = self.load_calibration()
         return {
             "counts": self.db.counts(),
@@ -1609,6 +2065,9 @@ class Supervisor:
             },
             "next_search_focus": {
                 "strategy": target,
+                "reason": reason,
+                "saturated": sorted(name for name, flag in saturated.items() if flag),
+                "quota_deficit": deficit,
                 "instruction": f"Try {target} next; do not repeat a better-tested family unless the mechanism is materially different.",
             },
             "recent_candidates": self.db.latest_candidates(12),
@@ -1700,10 +2159,21 @@ class Supervisor:
         return command
 
     def run_portfolio(self, command: list[str]) -> dict[str, Any]:
+        started = time.monotonic()
+        self.trace.emit("evaluator.start", mode="portfolio", argv=command)
         completed = subprocess.run(
             command, cwd=self.repo, text=True, capture_output=True,
             timeout=int(self.mission["limits"]["max_candidate_runtime_seconds"]),
             check=False, env=safe_child_environment(),
+        )
+        self.trace.emit(
+            "evaluator.end",
+            mode="portfolio",
+            argv=command,
+            returncode=completed.returncode,
+            duration_seconds=time.monotonic() - started,
+            stdout=completed.stdout,
+            stderr=completed.stderr,
         )
         if completed.returncode != 0:
             raise SupervisorError(completed.stderr.strip() or completed.stdout.strip() or "portfolio failed")
@@ -1773,6 +2243,67 @@ class Supervisor:
         })
         return calibration
 
+    def novelty_rejection(self, raw: dict[str, Any]) -> str | None:
+        """Why a VALID proposal should still not run: it is a near-duplicate or a structural repeat.
+
+        Returns a reason (recorded as a duplicate_proposal event so the
+        scheduler's penalties and the circuit breaker see it) or None.
+        """
+        policy = self.search_policy()
+        if raw.get("proposal_type", "family") == "family":
+            strategy = raw.get("strategy")
+            meta = self.family_meta.get(strategy) or {}
+            if not meta:
+                return None
+            here = normalized_parameters(raw.get("sparams", "") or "", meta)
+            threshold = float(policy["near_duplicate_distance"])
+            for candidate_id, tested in self.db.tested_family_configs(strategy):
+                distance = parameter_distance(here, normalized_parameters(tested, meta))
+                if distance < threshold:
+                    return (f"near-duplicate of {candidate_id} (every parameter within {distance:.0%} of its range; "
+                            f"the limit is {threshold:.0%}): change the mechanism or the horizon, not a digit")
+            return None
+        if raw.get("proposal_type") == "generated_spec" and isinstance(raw.get("spec"), dict):
+            spec = raw["spec"]
+            signature = spec_signature(spec)
+            recent = self.db.recent_specs(2000)
+            for tested in recent:
+                if spec_signature(tested) == signature:
+                    return ("a spec with exactly this leaf structure was already tested (entry: "
+                            + ", ".join(signature[0]) + "; exit: " + ", ".join(signature[1])
+                            + "); change which leaves are combined, not their numbers")
+            novelty = policy["spec_novelty"]
+            window = recent[: int(novelty["leaf_cap_window"])]
+            if len(window) >= 10:
+                cap = float(novelty["leaf_cap_share"])
+                for leaf in set(spec_leaf_types(spec.get("entry"))):
+                    share = sum(1 for tested in window if leaf in spec_leaf_types(tested.get("entry"))) / len(window)
+                    if share > cap:
+                        return (f"entry leaf {leaf} appears in {share:.0%} of the last {len(window)} specs "
+                                f"(cap {cap:.0%}); build the entry around a different mechanism")
+        return None
+
+    def record_semantic_duplicate(self, raw_content: str, strategy: str, reason: str) -> None:
+        proposal_hash = sha256_bytes(raw_content.encode())[:16]
+        artifact = self.artifacts / f"duplicate-{proposal_hash}.json"
+        write_json(artifact, {
+            "raw_model_content": raw_content,
+            "strategy": strategy,
+            "reason": reason,
+            "created_at": utc_now(),
+        })
+        self.db.event("semantic_duplicate", {
+            "artifact": str(artifact),
+            "strategy": strategy,
+            "reason": reason,
+        })
+        self.trace.emit(
+            "proposal.semantic_duplicate",
+            strategy=strategy,
+            reason=reason,
+            raw_model_content=raw_content,
+        )
+
     def incumbent_summary(self) -> list[dict[str, Any]] | None:
         """The incumbent's fold results, computed once per process (three 0.05 s backtests)."""
         if not hasattr(self, "_incumbent_cache"):
@@ -1795,6 +2326,9 @@ class Supervisor:
                 self.db.spec_leaf_usage() if focus == "generated_spec" else {},
                 self.db.counts(), self.load_calibration(),
                 self.catalogue, self.db.family_outcomes(),
+                self.db.family_deltas().get(focus, []) if focus not in ("generated_spec", "feature_request") else None,
+                frozenset(name for name, flag in self.saturation().items() if flag),
+                self.search_policy()["spec_novelty"],
             )
             schema_mode = "generated_spec" if focus == "generated_spec" else "feature_request" if focus == "feature_request" else None
             try:
@@ -1806,6 +2340,11 @@ class Supervisor:
                         None if schema_mode else focus,
                         None if schema_mode else self.families.get(focus),
                     ),
+                    trace_context={
+                        "focus": focus,
+                        "attempt": attempt,
+                        "mode": schema_mode or "family",
+                    },
                 )
             except SupervisorError as error:
                 self.db.event("proposal_request_error", {
@@ -1872,10 +2411,16 @@ class Supervisor:
                 raw["strategy"] = "generated_spec"
                 raw["sparams"] = ""
                 try:
-                    validate_proposal(raw, self.mission, self.families)
+                    validate_proposal(raw, self.mission, self.families, self.family_meta)
+                    raw["spec"] = validate_generated_spec(raw.get("spec"), int(self.mission["limits"]["max_parameters"]))
                 except SupervisorError as error:
                     self.record_invalid_proposal(content, str(error))
                     feedback = "Your previous generated_spec was invalid: " + str(error) + ". For generated_spec, sparams must be empty and spec must contain entry and exit rule trees."
+                    continue
+                rejection = self.novelty_rejection(raw)
+                if rejection:
+                    self.record_semantic_duplicate(content, "generated_spec", rejection)
+                    feedback = "Your previous spec was rejected as a repeat: " + rejection
                     continue
                 self.db.event("scheduled_creative_substitution", {
                     "scheduled_strategy": focus,
@@ -1893,13 +2438,18 @@ class Supervisor:
                 raw["strategy"] = "generated_spec"
             if raw.get("strategy") == focus:
                 try:
-                    validate_proposal(raw, self.mission, self.families)
+                    validate_proposal(raw, self.mission, self.families, self.family_meta)
                 except SupervisorError as error:
                     self.record_invalid_proposal(content, str(error))
                     feedback = (
                         "Your previous family proposal was invalid: " + str(error)
                         + f". Return strategy={focus!r} and use only the legal sparams shown for that family."
                     )
+                    continue
+                rejection = self.novelty_rejection(raw)
+                if rejection:
+                    self.record_semantic_duplicate(content, focus, rejection)
+                    feedback = "Your previous proposal was rejected as a repeat: " + rejection
                     continue
                 return raw, content, response
             error = f"model ignored scheduled strategy {focus}"
@@ -1909,7 +2459,7 @@ class Supervisor:
         raise ScheduledFocusSkipped(f"model failed to follow scheduled strategy {focus} after 3 attempts")
 
     def record_proposal(self, raw: dict[str, Any], raw_content: str, response: dict[str, Any]) -> dict[str, Any]:
-        candidate = validate_proposal(raw, self.mission, self.families)
+        candidate = validate_proposal(raw, self.mission, self.families, self.family_meta)
         if self.db.has_config(candidate["config_hash"]):
             self.db.event(
                 "duplicate_proposal",
@@ -1944,6 +2494,11 @@ class Supervisor:
         }
         write_json(self.artifacts / candidate["candidate_id"] / "proposal.json", artifact)
         self.db.event("proposal_recorded", {"proposal_hash": candidate["proposal_hash"]}, candidate["candidate_id"])
+        self.trace.emit(
+            "proposal.accepted",
+            candidate_id=candidate["candidate_id"],
+            proposal=candidate["proposal"],
+        )
         return candidate
 
     def record_invalid_proposal(self, raw_content: str, error: str) -> None:
@@ -1951,6 +2506,7 @@ class Supervisor:
         artifact = self.artifacts / f"invalid-{proposal_hash}.json"
         write_json(artifact, {"raw_model_content": raw_content, "error": error, "created_at": utc_now()})
         self.db.event("invalid_proposal", {"artifact": str(artifact), "error": error})
+        self.trace.emit("proposal.rejected", raw_model_content=raw_content, error=error)
 
     def command_for_fold(self, candidate: dict[str, Any], start: str, end: str) -> list[str]:
         proposal = candidate["proposal"]
@@ -2002,6 +2558,13 @@ class Supervisor:
             folder.mkdir(parents=True, exist_ok=True)
             stdout_path, stderr_path = folder / "stdout.txt", folder / "stderr.txt"
             started = time.monotonic()
+            self.trace.emit(
+                "evaluator.start",
+                mode="candidate_fold",
+                candidate_id=candidate_id,
+                fold=index + 1,
+                argv=command,
+            )
             try:
                 completed = subprocess.run(
                     command, cwd=self.repo, text=True, capture_output=True,
@@ -2010,6 +2573,17 @@ class Supervisor:
                 )
                 stdout_path.write_text(completed.stdout)
                 stderr_path.write_text(completed.stderr)
+                self.trace.emit(
+                    "evaluator.end",
+                    mode="candidate_fold",
+                    candidate_id=candidate_id,
+                    fold=index + 1,
+                    argv=command,
+                    returncode=completed.returncode,
+                    duration_seconds=time.monotonic() - started,
+                    stdout=completed.stdout,
+                    stderr=completed.stderr,
+                )
                 if completed.returncode != 0:
                     metrics = {"error": completed.stderr.strip() or completed.stdout.strip(), "duration_seconds": time.monotonic() - started}
                     self.db.finish_run(run_id, "failed", completed.returncode, stdout_path, stderr_path, metrics)
@@ -2022,14 +2596,44 @@ class Supervisor:
             except subprocess.TimeoutExpired as error:
                 stdout_path.write_text(error.stdout or "")
                 stderr_path.write_text(error.stderr or "")
+                self.trace.emit(
+                    "evaluator.end",
+                    mode="candidate_fold",
+                    candidate_id=candidate_id,
+                    fold=index + 1,
+                    argv=command,
+                    status="timeout",
+                    duration_seconds=time.monotonic() - started,
+                    stdout=error.stdout or "",
+                    stderr=error.stderr or "",
+                )
                 metrics = {"error": "candidate timeout", "duration_seconds": time.monotonic() - started}
                 self.db.finish_run(run_id, "timeout", None, stdout_path, stderr_path, metrics)
                 results.append(metrics)
             except KeyboardInterrupt:
+                self.trace.emit(
+                    "evaluator.end",
+                    mode="candidate_fold",
+                    candidate_id=candidate_id,
+                    fold=index + 1,
+                    argv=command,
+                    status="interrupted",
+                    duration_seconds=time.monotonic() - started,
+                )
                 metrics = {"error": "operator interrupt", "duration_seconds": time.monotonic() - started}
                 self.db.finish_run(run_id, "interrupted", None, stdout_path, stderr_path, metrics)
                 raise
             except Exception as error:
+                self.trace.emit(
+                    "evaluator.end",
+                    mode="candidate_fold",
+                    candidate_id=candidate_id,
+                    fold=index + 1,
+                    argv=command,
+                    status="exception",
+                    error=f"{type(error).__name__}: {error}",
+                    duration_seconds=time.monotonic() - started,
+                )
                 metrics = {
                     "error": f"{type(error).__name__}: {error}",
                     "duration_seconds": time.monotonic() - started,
@@ -2155,7 +2759,12 @@ class Supervisor:
             "summary": summary,
             "instruction": "Review this development-only result. Keep the recommendation advisory.",
         }, indent=2)
-        content, response = self.reviewer_client.chat(system, user, review_schema())
+        content, response = self.reviewer_client.chat(
+            system,
+            user,
+            review_schema(),
+            trace_context={"candidate_id": candidate_id},
+        )
         try:
             review = extract_json(content)
         except SupervisorError as error:
@@ -2199,6 +2808,7 @@ class Supervisor:
                     break
                 focus = self.state_context()["next_search_focus"]["strategy"]
                 self.write_heartbeat("proposing", iteration, focus=focus)
+                self.trace.emit("iteration.start", iteration=iteration, focus=focus)
                 try:
                     result = self.run_once(evaluate=True)
                     if result.get("status") == "survives_development":
@@ -2210,6 +2820,7 @@ class Supervisor:
                             result["review_error"] = str(error)
                     last_candidate_id = result.get("candidate_id")
                     self.write_heartbeat("idle", iteration, last_candidate_id)
+                    self.trace.emit("iteration.end", iteration=iteration, result=result)
                     print(json.dumps({"iteration": iteration, **result}), flush=True)
                 except ScheduledFocusSkipped as error:
                     self.db.event("iteration_skipped", {"reason": str(error), "iteration": iteration})
@@ -2371,6 +2982,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--artifacts", type=Path, default=DEFAULT_ARTIFACTS)
     parser.add_argument("--heartbeat", type=Path, default=DEFAULT_HEARTBEAT)
     parser.add_argument("--calibration", type=Path, default=DEFAULT_CALIBRATION)
+    parser.add_argument("--trace-file", type=Path, default=DEFAULT_TRACE,
+                        help="append structured dialogue/evaluator events to this JSONL file")
+    parser.add_argument("--trace-console", action="store_true",
+                        help="mirror trace events and streamed model text to stderr")
     subparsers = parser.add_subparsers(dest="command", required=True)
     subparsers.add_parser("doctor")
     subparsers.add_parser("propose")
@@ -2478,6 +3093,8 @@ def main(argv: list[str] | None = None) -> int:
             registry_path, args.artifacts.resolve(), args.heartbeat.resolve(),
             args.calibration.resolve(), args.llm_min_interval, args.reviewer_model,
             args.num_ctx, None if args.generator_think == "off" else args.generator_think,
+            args.trace_file.resolve() if args.trace_file else None,
+            args.trace_console,
         )
         try:
             if args.command in {"propose", "run-once", "review", "daemon", "calibrate-null"}:

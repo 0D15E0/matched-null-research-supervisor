@@ -43,7 +43,7 @@ Plain text:
 ## 1. Circuit breakers
 
 Before anything else the daemon counts consecutive `invalid_proposal` and
-`duplicate_proposal` events since the last `proposal_recorded`. Twenty of
+exact `duplicate_proposal` events since the last `proposal_recorded`. Twenty of
 either (mission `limits`) opens the breaker: a `daemon_paused` event, heartbeat
 `paused`, and the loop exits. This is what a broken prompt, a wedged model or
 an exhausted family looks like, and the right response is a human, not another
@@ -51,8 +51,27 @@ thousand iterations. Restart the daemon to close the breaker.
 
 ## 2. Scheduling
 
-The mission's `search_policy.preferred_sequence` lists the modes and families
-the loop may propose. The scheduler picks the one with the lowest score:
+Every family the binary lists is in rotation, plus `generated_spec`; the
+mission's `preferred_sequence` is only a tie-break order. (The v2 mission named
+ten modes by hand, and in 705 evaluations 25 of the 35 registry families were
+never scheduled while tsmom was scheduled 151 times.)
+
+The scheduler works in three steps:
+
+1. **Quotas by mode.** Each candidate belongs to a mode: `spec`
+   (generated_spec), `control` (the coin-flip and always-long controls),
+   `calendar` (calendar_rule) or `family` (everything else). The mission sets
+   a target share per mode, by default 50/5/5/40 percent, and the realized
+   share is measured over the last `quota_window` recorded candidates. The
+   mode furthest below its target is scheduled. Least-tested allocation on its
+   own is uniform allocation, and it gave controls 15% of the first night's
+   budget after the null had already been calibrated.
+2. **Saturation.** A family is saturated once it has at least 30 scored
+   evaluations and its best result did not improve by 0.10 over the best it had
+   20 evaluations earlier. Saturated families leave the rotation, except for
+   one drift check every 20 recorded candidates. tsmom reached saturation at
+   about its 30th evaluation and then ran 120 more.
+3. **Within the chosen mode**, the least-tested family wins, with penalties:
 
 ```
 score(family) = candidates recorded for it
@@ -60,16 +79,12 @@ score(family) = candidates recorded for it
               + 10 x sum of exp(-age_hours / 24) over its duplicate rejections
 ```
 
-so the least-tested family goes first, a family that just failed or just
-produced duplicates is pushed back by about ten candidates' worth, and the
-penalty fades over a day. There is no rule that retires a family permanently;
-an earlier version had one and the rotation collapsed to a single mode within
-three hours.
+The heartbeat carries the chosen focus and the scheduler's reason
+(`mode spec is +26% below its quota`, `drift check of a saturated family`).
 
-`feature_request` is excluded from the rotation unless the mission sets
-`search_policy.schedule_feature_requests`. It produces notes for a human, not
-runnable candidates, and twenty of them accumulated in one afternoon when it
-was scheduled.
+`feature_request` is excluded unless the mission sets
+`search_policy.schedule_feature_requests`: it produces notes for a human, not
+runnable candidates.
 
 ## 3. Proposal
 
@@ -90,19 +105,37 @@ The supervisor overwrites `vol_target`, `weights`, `vol_lookback` and
 not a hypothesis, and letting the model choose it would turn every comparison
 into a leverage comparison.
 
-## 4. Validation and canonicalisation
+## 4. Validation, canonicalisation and novelty
 
 `validate_proposal` checks, in order: required fields; prose lengths, and that
 the mechanism is at least eight words of prose rather than a list of leaf
 names; the strategy exists in the live registry (`list-strategies`, read at
 startup, never a hard-coded list); every `sparams` entry names a parameter of
 that family and sits inside its published bounds; for specs, the grammar and
-every leaf's fields, units and ranges; no reference to holdout, deployment or
-2024+ resources in the prose.
+every leaf's fields, units and ranges, including a floor of 12 bars on trend
+windows; no reference to holdout, deployment or 2024+ resources in the prose.
 
-The surviving configuration is canonicalised (sorted parameters, `%g` number
-formatting, normalised spec tree) and hashed. That hash is the candidate id.
+The surviving configuration is canonicalised: parameters sorted, integer
+parameters rounded the way the C++ registry rounds them (half away from zero,
+so `enterVotes=2.5` hashes as the `enterVotes=3` it executes), numbers in `%g`
+format, spec tree normalised. That is hashed, and the hash is the candidate id.
 If it already exists, the proposal is a duplicate and no backtest runs.
+
+Two more rejections happen inside the attempt loop, so the model gets the
+reason as feedback and may try again within its three attempts:
+
+- **Near-duplicate parameters.** Every parameter is scaled to [0,1] over its
+  legal range, defaults filled in, and the vector is compared with every tested
+  configuration of the same family. Within 10% on every parameter is a repeat.
+  This is what stops a family from being swept a digit at a time.
+- **Structural repeat of a spec.** A spec whose entry and exit use exactly the
+  same set of leaf types as a tested spec is a repeat regardless of numbers.
+  An entry leaf that appears in more than 40% of the last 30 specs is refused,
+  so the search moves to a different mechanism.
+
+Both are recorded as `semantic_duplicate` events, so they feed the scheduler's
+penalties without being mistaken for malformed model output or opening the
+invalid-proposal circuit breaker.
 
 ## 5. Evaluation
 
@@ -177,7 +210,8 @@ sleeps `--interval` seconds.
 | model returned no JSON or invalid JSON | `invalid_proposal` | none | retry, up to 3 |
 | Ollama request failed or returned empty content | `proposal_request_error` | none | retry with backoff, up to 3 |
 | three attempts failed | `scheduled_strategy_failed`, `iteration_skipped` | none | next iteration |
-| same configuration already tested | `duplicate_proposal`, `iteration_skipped` | none | next iteration |
+| same configuration already tested (exact hash, after all attempts) | `duplicate_proposal`, `iteration_skipped` | none | next iteration |
+| near-duplicate parameters or structural repeat of a spec | `semantic_duplicate` | none | retry with the reason, up to 3 |
 | a fold failed or timed out | `candidate_classified` | `killed / execution_failed` | next iteration |
 | exception inside evaluation | `candidate_evaluation_exception` | `killed / evaluation_exception` | next iteration |
 | Ctrl-C during evaluation | `candidate_interrupted` | `interrupted / operator_interrupt` | stops |

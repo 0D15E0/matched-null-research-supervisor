@@ -70,9 +70,9 @@ free of machine-specific usernames and directory layouts.
 | Path | Purpose |
 |---|---|
 | `supervisor.py` | Local Ollama supervisor and evaluator |
-| `missions/local-trend-discovery-v2.json` | Active immutable development policy |
+| `missions/local-trend-discovery-v4.json` | Active immutable development policy (v2 evaluation protocol + finalized search policy) |
 | `state/research-v2.sqlite3` | Active durable candidates, runs, events, and reviews |
-| `state/null-calibration-v2.json` | Active 200-seed random-control null distribution |
+| `state/null-calibration-v4.json` | Active v4 200-seed random-control null distribution |
 | `state/heartbeat-v2.json` | Active daemon heartbeat |
 | `state/research-v2.lock` | Single-instance lock while running |
 | `artifacts-v2/<candidate-id>/` | Active proposal, spec, fold output, result, and review files |
@@ -80,7 +80,8 @@ free of machine-specific usernames and directory layouts.
 | `features/` | Local feature-provider contracts; no remote fetches |
 | `scripts/install_models.sh` | Pull the approved local model tags |
 | `scripts/start_ollama.sh` | Verify or start loopback Ollama |
-| `logs/` | Reserved for supervisor output redirection |
+| `logs/trace-v4.jsonl` | Ignored structured generator/reviewer/evaluator trace |
+| `logs/supervisor-v4.log` | Daemon iteration output when started with nohup |
 
 The repository may also contain legacy v1 databases and artifacts. They are
 historical evidence only. Do not mix them into v2 status or reclassification.
@@ -176,7 +177,7 @@ ctest --test-dir build --output-on-failure
 
 The null calibration is required before a candidate can become `frontier`.
 It runs 200 `control_random` seeds over the three fixed development folds and
-writes `state/null-calibration-v2.json`.
+writes `state/null-calibration-v4.json`.
 
 Run it once:
 
@@ -198,8 +199,8 @@ A recalibration invalidates the meaning of previous frontier decisions. Keep
 the old artifact before forcing a new one:
 
 ```sh
-/bin/cp state/null-calibration-v2.json \
-  state/null-calibration-v2.$(/bin/date +%Y%m%d-%H%M%S).json
+/bin/cp state/null-calibration-v4.json \
+  state/null-calibration-v4.$(/bin/date +%Y%m%d-%H%M%S).json
 ```
 
 ## Start the Continuous Search
@@ -210,7 +211,9 @@ normalization problems:
 ```sh
 /opt/homebrew/bin/python3 \
   /path/to/local_ollama_research/supervisor.py \
-  --model gpt-oss:20b --reviewer-model qwen3-coder:latest daemon --interval 30
+  --model gpt-oss:20b --reviewer-model qwen3-coder:latest \
+  --trace-file /path/to/local_ollama_research/logs/trace-v4.jsonl \
+  daemon --interval 30
 ```
 
 The daemon:
@@ -250,6 +253,43 @@ For a controlled smoke run:
 
 Stop gracefully with `Ctrl-C` in the daemon terminal. The current candidate is
 bounded by a per-fold timeout, and the heartbeat is written as `stopped`.
+
+## Inspect The Live Dialogue
+
+The trace is append-only JSONL and is ignored by Git. It records the full
+generator/reviewer prompts, streamed thinking/content chunks, validation retry
+feedback, exact evaluator argv, evaluator stdout/stderr, and iteration events.
+
+Watch the raw trace:
+
+```sh
+/usr/bin/tail -n 0 -F /path/to/local_ollama_research/logs/trace-v4.jsonl
+```
+
+Watch only the conversational content with `jq`:
+
+```sh
+/usr/bin/tail -n 0 -F /path/to/local_ollama_research/logs/trace-v4.jsonl \
+  | /usr/bin/jq --unbuffered -r 'if .event == "llm.request_start" then "\n--- " + .role + " prompt " + .request_id + " ---\n" + .system + "\nUSER:\n" + .user elif .event == "llm.chunk" and ((.thinking // "") != "") then "[thinking] " + .thinking elif .event == "llm.chunk" and ((.content // "") != "") then "[content] " + .content elif .event == "llm.request_end" then "\n--- response complete ---" else empty end'
+```
+
+`[thinking]` is the model's internal reasoning channel. The actual proposal is
+the `[content]` stream; it is the JSON object that the supervisor validates.
+Replace `/path/to/local_ollama_research` with the actual checkout path on this
+machine. `--unbuffered` is required for chunks to appear immediately.
+
+Show the latest completed generator prompt and response without following the
+file:
+
+```sh
+TRACE=/path/to/local_ollama_research/logs/trace-v4.jsonl
+/usr/bin/jq -s '[.[] | select(.event == "llm.request_start" and .role == "generator")] | last' "$TRACE"
+/usr/bin/jq -s '[.[] | select(.event == "llm.request_end" and .role == "generator")] | last' "$TRACE"
+```
+
+The existing candidate artifacts remain the authoritative post-run record:
+`artifacts-v2/<candidate-id>/proposal.json` contains the raw accepted model
+response, and each `fold-N/stdout.txt` contains the exact C++ evaluator output.
 
 ## Monitor the Search
 
@@ -477,6 +517,7 @@ Useful event types:
 | `candidate_reclassified` | Gates were recalculated |
 | `invalid_proposal` | Raw model output failed validation |
 | `duplicate_proposal` | Normalized configuration already exists |
+| `semantic_duplicate` | Valid proposal repeated a tested mechanism or parameter neighborhood |
 | `iteration_skipped` | A focus failed or repeated a candidate without an operational crash |
 | `iteration_error` | The current iteration hit an operational error |
 | `circuit_breaker_open` | Consecutive invalid/duplicate limit was reached |
@@ -649,7 +690,7 @@ As of the latest maintenance pass:
 - endpoint: `http://127.0.0.1:11434`;
 - development boundary: `2023-12-31`;
 - vol window: `30` bars; warm-up: `600` bars;
-- null calibration: v2 200 seeds, read from `state/null-calibration-v2.json`;
+- null calibration: v4 200 seeds, read from `state/null-calibration-v4.json`;
 - incumbent: `ensemble_vote`, `enterVotes=2,exitVotes=0`;
 - autonomous holdout access: disabled;
 - autonomous deployment access: disabled.

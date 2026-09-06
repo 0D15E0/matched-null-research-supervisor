@@ -26,8 +26,8 @@ flowchart TD
     D["LEDGER counts"]
     E["STRATEGY ZOO<br/>all 35 families: provenance + tested count + best delta vs incumbent"]
     F{mode}
-    G["generated_spec block<br/>grammar · leaf table with units · over-used and never-used leaves<br/>· last 8 specs tried with outcomes"]
-    H["family block<br/>this family's parameter ranges only<br/>· parameter sets already tried with outcomes"]
+    G["generated_spec block<br/>grammar · leaf table with units · over-used and never-used leaves<br/>· NOVELTY RULES · last 8 specs tried with outcomes"]
+    H["family block<br/>this family's parameter ranges only<br/>· THIS FAMILY'S RECORD: evaluated, best, median, saturated?<br/>· parameter sets already tried with outcomes"]
     I["ATTEMPT n of 3 · previous rejection reason"]
     A --> B --> C --> D --> E --> F
     F -- generated_spec --> G --> I
@@ -45,6 +45,8 @@ Each block exists because of a specific failure earlier in the project:
 | over-used / never-used leaves | fourteen weekday gates and twenty-five SMA leaves in the first day's specs |
 | ALREADY TESTED | 32 of the first day's 74 rejections were duplicates of configurations the model could not see |
 | this family's ranges only | dumping every family's bounds cost 2.5k tokens per call, and the model can act on none of them once the schema pins the strategy |
+| THIS FAMILY'S RECORD and SATURATED tags | 151 tsmom parameter sets produced a best of +0.27, the same as the best of 106 coin-flip controls; the model could not see the plateau it was sweeping |
+| NOVELTY RULES | the rejections for near-duplicates, repeated spec structures and sub-12-bar trend windows are stated up front so the model can avoid them rather than learn them from feedback |
 | PREVIOUS ATTEMPT REJECTED | without the reason, retries repeated the error |
 
 Typical size: about 2,400 prompt tokens including the zoo, against about 6,900

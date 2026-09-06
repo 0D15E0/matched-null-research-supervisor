@@ -25,15 +25,16 @@ permission to access holdout data, edit live deployment files, or place orders.
 - [Generator agent contract](agents/GENERATOR.md)
 - [Reviewer agent contract](agents/REVIEWER.md)
 - [Supervisor contract](agents/SUPERVISOR.md)
-- [active v2 mission](missions/local-trend-discovery-v2.json)
-- [historical v1 mission](missions/local-trend-discovery-v1.json)
+- [active v4 mission](missions/local-trend-discovery-v4.json)
+- [historical v3, v2 and v1 missions](missions/)
 
 ## Current status
 
 Phase 0/1 is operational:
 
-The active supervisor uses a fresh v2 ledger and protocol-matched settings.
-The earlier v1 ledger remains historical and is not mixed with v2 evidence.
+The active mission is v4: the same evaluation protocol as v2 in the same ledger, with a
+new search policy (whole-registry rotation, mode quotas, saturation, near-duplicate and
+spec-novelty gates). The v1 ledger is archived and not mixed with v2/v3/v4 evidence.
 
 - `supervisor.py` calls Ollama only on loopback and validates structured JSON;
 - the mission, strategy registry, and development boundary are checked before
@@ -56,7 +57,7 @@ The earlier v1 ledger remains historical and is not mixed with v2 evidence.
 The current candidates are research evidence only. Promotion is now blocked by
 the incumbent-relative and null-calibrated gates unless a candidate clears both.
 
-The null calibration is now stored in `state/null-calibration-v2.json`. The first
+The v4 null calibration is stored in `state/null-calibration-v4.json`. The first
 200-seed calibration produced these development-only 99th-percentile gates:
 
 - mean excess Sharpe versus the basket: `0.4139`;

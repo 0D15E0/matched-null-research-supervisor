@@ -27,7 +27,7 @@ flowchart TB
 | layer | responsibility | key functions |
 |---|---|---|
 | CLI | parse flags, take the single-instance lock, dispatch | `main`, `build_parser` |
-| Supervisor | the iteration: schedule a focus, get a proposal, validate, evaluate, classify, review, checkpoint | `Supervisor.daemon`, `run_once`, `generate_proposal`, `state_context` |
+| Supervisor | the iteration: schedule a focus (quotas, saturation), get a proposal, validate, reject repeats, evaluate, classify, review, checkpoint | `Supervisor.daemon`, `run_once`, `generate_proposal`, `state_context`, `novelty_rejection` |
 | Prompt builder | pure function from ledger facts to (system, user) text | `generator_prompts`, `leaf_reference_lines`, `spec_rule_defs` |
 | Validators | reject anything the mission or the evaluator cannot accept, before it costs a backtest | `validate_mission`, `validate_proposal`, `validate_generated_spec`, `normalize_spec_node` |
 | OllamaClient | the only network code; loopback URL, proxy bypass, redirect refusal, exponential backoff | `OllamaClient.chat`, `tags` |
@@ -39,7 +39,7 @@ flowchart TB
 ```
 local_ollama_research/
 ├── supervisor.py                  everything above
-├── missions/local-trend-discovery-v2.json   the active, hashed policy (v1 is history)
+├── missions/local-trend-discovery-v4.json   the active, hashed policy (v2 protocol + finalized search policy; v1/v2/v3 are history)
 ├── agents/                        the contracts the generator, reviewer and supervisor must honour
 ├── scripts/bench_generator.py     model x schema benchmark using the supervisor's own validator
 ├── scripts/install_models.sh, start_ollama.sh
@@ -47,7 +47,7 @@ local_ollama_research/
 │   ├── research-v2.sqlite3        the ledger (WAL mode)
 │   ├── research-v2.lock           flock held by the one running supervisor
 │   ├── heartbeat-v2.json          status, iteration, focus, last error; rewritten every step
-│   ├── null-calibration-v2.json   200 control_random seeds through the folds; the q99 gates
+│   ├── null-calibration-v4.json   200 control_random seeds through the folds; the q99 gates
 │   ├── best-v2.json               the current best candidate, rewritten when it changes
 │   └── archive-*/                 v1 ledger and superseded supervisor.py copies
 ├── artifacts-v2/
