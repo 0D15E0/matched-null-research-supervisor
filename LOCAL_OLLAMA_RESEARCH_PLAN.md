@@ -40,9 +40,9 @@ used by the supervisor, and no deployment file or live state was touched.
 
 Observed on the development Mac:
 
-- Apple model: `Mac16,8`
-- CPU: 12 cores
-- Memory: 51.2 GB
+- An Apple-silicon Mac with enough unified memory to hold one mid-sized model
+  resident alongside native backtests. The sizing notes below assume roughly
+  48 GB; less means loading one model at a time.
 - Ollama client: `0.32.14`
 - Ollama server: installed but not currently running
 - Models already pulled (`~/.ollama`, 65 GB): `glm-5`, `qwen3-coder`,
@@ -84,7 +84,7 @@ has a numbered addendum in `PROFITABILITY_PLAN.md` or a section in the README.
    infrastructure proving plus a calibrated null - not discovery.
 2. **The kill rules in the registry are basket-relative and lenient.** A
    candidate can clear "+0.10 mean excess Sharpe over the buy-and-hold
-   basket" while losing to the live book on every fold - this happened on
+   basket" while losing to the reference rule on every fold - this happened on
    2026-09-05 (`factor-trend-w050-vt020`: survives_development, and worse
    than the incumbent on all three folds). For a loop generating hundreds of
    candidates the frontier must be **incumbent-relative** and
@@ -151,7 +151,7 @@ descriptive check of a frozen candidate, by a human, once, and the result must
 be written down as descriptive. Clean evidence for a new candidate comes from
 a **forward test registered in `holdout.json` before it starts**, on paper or
 live, judged no earlier than its stated read date - the pattern already in
-use for the live book (registered 2026-08-24, readable 2027-08-25). The local
+use for the incumbent (registered 2026-08-24, readable 2027-08-25). The local
 supervisor must have no command that performs either.
 
 ### Deterministic evaluation
@@ -251,8 +251,8 @@ terms.
 
 ### Resource policy
 
-The 51.2 GB machine can support a local model and native backtests, but memory
-should not be treated as unlimited:
+A machine of that size can support a local model and native backtests, but
+memory should not be treated as unlimited:
 
 - Keep one generation model loaded during normal operation.
 - Load the reviewer only for review batches, or use a separate bounded queue.
@@ -768,7 +768,7 @@ that have all been measured on it. The clean route is the one the repository
 already uses: a human freezes the candidate ID, parameters, binary revision
 and sizing, registers a forward test in `holdout.json` with its criteria and
 earliest read date **before it starts**, and runs it on paper alongside the
-live book. Results are imported as read-only evidence when the read date
+deployment. Results are imported as read-only evidence when the read date
 arrives. A single descriptive 2024+ run of the frozen candidate may be taken
 by the human and must be labelled descriptive; it does not promote anything.
 

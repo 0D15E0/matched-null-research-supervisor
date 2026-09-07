@@ -68,7 +68,7 @@ These are enforced in code, not policy documents:
   emit are `portfolio`, `backtest`, `list-strategies` and the causality tool.
   The mission file that allows anything else fails validation at startup.
 - **Promote anything.** `frontier` means "worth a human's attention", nothing
-  more. The live book is untouched by anything this loop concludes.
+  more. No deployment is changed by anything this loop concludes.
 
 ## What a good day looks like
 

@@ -15,6 +15,7 @@ Read in this order:
 | [CLI_INTERFACE.md](CLI_INTERFACE.md) | Exactly how the supervisor talks to `cli_trader`, and the boundary it never crosses |
 | [RULE_LANGUAGE.md](RULE_LANGUAGE.md) | The `generated_spec` rule language the model composes new strategies in |
 | [PROMPTS_AND_MODELS.md](PROMPTS_AND_MODELS.md) | What the generator and reviewer are told, which local models run them, and why |
+| [FINDINGS.md](FINDINGS.md) | What the loop has actually found, and how far each result fell under scrutiny |
 | [GLOSSARY.md](GLOSSARY.md) | Every status, classification, event type and term |
 
 Diagrams are Mermaid blocks. GitHub renders them inline; in VS Code use the

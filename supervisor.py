@@ -415,6 +415,42 @@ def normalized_parameters(sparams: str, meta: dict[str, dict[str, Any]]) -> dict
     return out
 
 
+def enumerable_space_size(meta: dict[str, dict[str, Any]], cap: int = 10_000) -> int | None:
+    """How many distinct configurations a family can express, or None if effectively unbounded.
+
+    A family whose parameters are all integers spans a finite grid; one with no
+    parameters at all spans exactly one configuration. Once the ledger holds
+    that many distinct parameter sets the family cannot produce anything new,
+    and scheduling it again can only ever yield a duplicate.
+
+    That is not hypothetical: `control_always_long` takes no parameters, so its
+    single configuration was tested on 2026-09-05 and every later proposal for
+    it was an exact duplicate. Because a duplicate records no candidate, and the
+    quota deficit is measured in RECORDED candidates, the control mode stayed
+    starved, the scheduler re-picked the same family, and twenty of those opened
+    the circuit breaker (three times, 2026-09-06 09:07 to 09:35). Four more
+    parameterless families - pure_ichimoku, pencil_extrap, patterns and
+    fib_ichimoku - were one duplicate each away from the same trap.
+
+    Returns None when any parameter is continuous or the grid exceeds `cap`,
+    which is the honest answer for `control_random` (a continuous entry
+    probability and a seed spanning 100,000 values): a grid the loop could not
+    cover in weeks is governed by saturation instead, not by exhaustion.
+    """
+    size = 1
+    for spec in meta.values():
+        if not spec.get("is_int"):
+            return None
+        low, high = int(round(float(spec["lo"]))), int(round(float(spec["hi"])))
+        count = high - low + 1
+        if count <= 0:
+            return None
+        size *= count
+        if size > cap:
+            return None
+    return size
+
+
 def parameter_distance(a: dict[str, float], b: dict[str, float]) -> float:
     """L-infinity distance between two normalised parameter vectors."""
     return max((abs(a[k] - b.get(k, 0.0)) for k in a), default=0.0)
@@ -1276,6 +1312,77 @@ class Registry:
                 out.setdefault(strategy, []).append(float(delta))
         return out
 
+    def distinct_config_counts(self) -> dict[str, int]:
+        """strategy -> number of distinct parameter sets recorded, in one scan."""
+        seen: dict[str, set[str]] = {}
+        for (proposal_json,) in self.db.execute("SELECT proposal_json FROM candidates"):
+            try:
+                proposal = json.loads(proposal_json)
+            except (TypeError, json.JSONDecodeError):
+                continue
+            strategy = proposal.get("strategy")
+            if isinstance(strategy, str):
+                seen.setdefault(strategy, set()).add(proposal.get("sparams", "") or "")
+        return {name: len(values) for name, values in seen.items()}
+
+    def duplicates_since_last_record(self, limit: int = 1000,
+                                     within_hours: float | None = None) -> dict[str, int]:
+        """strategy -> duplicate rejections since that family last produced a NEW candidate.
+
+        Counted from the last recorded candidate so the number self-clears: a
+        family that manages a fresh configuration starts again from zero.
+
+        `within_hours` additionally ignores older duplicates, which is what keeps
+        this from becoming a life sentence. A family excluded on a duplicate can
+        never record the new candidate that would clear it, because it is no
+        longer scheduled; without an expiry, one repeated proposal would retire a
+        family whose parameter space is barely explored.
+        """
+        cutoff = None
+        if within_hours is not None:
+            cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=float(within_hours))
+        strategy_of: dict[str, str] = {}
+        for row in self.db.execute("SELECT candidate_id, proposal_json FROM candidates"):
+            try:
+                strategy = json.loads(row["proposal_json"]).get("strategy")
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if isinstance(strategy, str):
+                strategy_of[row["candidate_id"]] = strategy
+
+        # Walk backwards by event_id, which is strictly monotonic. Timestamps
+        # are NOT usable here: utc_now() truncates to whole seconds, so a
+        # duplicate landing in the same second as the family's last recorded
+        # candidate compared equal and was dropped - exactly the case a reroute
+        # creates, since it records the duplicate and re-schedules at once.
+        counts: dict[str, int] = {}
+        settled: set[str] = set()
+        for row in self.db.execute(
+            "SELECT candidate_id, event_type, payload_json, created_at FROM events "
+            "WHERE event_type IN ('duplicate_proposal', 'semantic_duplicate', 'proposal_recorded') "
+            "ORDER BY event_id DESC LIMIT ?", (limit,),
+        ):
+            try:
+                strategy = json.loads(row["payload_json"]).get("strategy")
+            except (TypeError, json.JSONDecodeError):
+                strategy = None
+            if not isinstance(strategy, str) and row["candidate_id"]:
+                strategy = strategy_of.get(row["candidate_id"])
+            if not isinstance(strategy, str) or strategy in settled:
+                continue
+            if row["event_type"] == "proposal_recorded":
+                settled.add(strategy)          # older events precede its last new candidate
+                continue
+            if cutoff is not None:
+                try:
+                    created = dt.datetime.fromisoformat(row["created_at"])
+                except (TypeError, ValueError):
+                    created = None
+                if created is not None and created < cutoff:
+                    continue
+            counts[strategy] = counts.get(strategy, 0) + 1
+        return counts
+
     def tested_family_configs(self, strategy: str) -> list[tuple[str, str]]:
         """(candidate_id, sparams) of every recorded candidate of one family."""
         out = []
@@ -1987,16 +2094,68 @@ class Supervisor:
         policy.setdefault("exclude", [])
         policy.setdefault("saturation", {"min_evaluations": 30, "window": 20, "min_improvement": 0.10, "drift_every": 20})
         policy.setdefault("near_duplicate_distance", 0.10)
+        # A family is routed out of the rotation after this many duplicate
+        # rejections since its last new candidate. 1 means the first duplicate
+        # is enough, which is the only safe setting for a family whose
+        # configuration grid is already covered.
+        policy.setdefault("exhaust_after_duplicates", 1)
+        # ...and for how long that holds. Exhaustion by a covered grid is
+        # permanent and provable; exhaustion by duplicates is a cooldown, or a
+        # family the model happened to repeat once would be retired for good
+        # while most of its parameter space was still unexplored.
+        policy.setdefault("exhaust_duplicate_hours", 6.0)
         policy.setdefault("spec_novelty", {"leaf_cap_share": 0.40, "leaf_cap_window": 30})
         return policy
 
     def saturation(self) -> dict[str, bool]:
+        """Which PARAMETER families have stopped improving.
+
+        `generated_spec` is deliberately absent: saturation is a statement about
+        a parameter plateau, and a rule language has no parameter grid to
+        exhaust. Its repetition is governed by the structural-signature and
+        leaf-cap gates instead. It is excluded explicitly so that adding it to
+        the registry one day cannot silently remove the scheduler's fallback.
+        """
         sat = self.search_policy()["saturation"]
         deltas = self.db.family_deltas()
         return {
             name: is_saturated(deltas.get(name, []), int(sat["min_evaluations"]), int(sat["window"]), float(sat["min_improvement"]))
-            for name in self.families
+            for name in self.families if name != "generated_spec"
         }
+
+    def exhausted(self) -> dict[str, str]:
+        """Families that cannot produce a new configuration right now, and why.
+
+        Two ways to get here, one permanent and one self-clearing:
+          * the family's configuration grid is finite and every point in it has
+            been recorded (`enumerable_space_size`), which is permanent;
+          * it has produced `exhaust_after_duplicates` duplicate rejections
+            since it last recorded a new candidate and within the last
+            `exhaust_duplicate_hours`, which clears when either the cooldown
+            expires or it manages a fresh configuration.
+        Either way the scheduler must not pick it, because a duplicate records
+        nothing and therefore cannot reduce the quota deficit that selected it.
+        """
+        policy = self.search_policy()
+        threshold = int(policy["exhaust_after_duplicates"])
+        cooldown = float(policy["exhaust_duplicate_hours"])
+        distinct = self.db.distinct_config_counts()
+        duplicates = self.db.duplicates_since_last_record(within_hours=cooldown)
+        out: dict[str, str] = {}
+        for name in self.families:
+            if name == "generated_spec":
+                continue
+            size = enumerable_space_size(self.family_meta.get(name) or {})
+            tested = distinct.get(name, 0)
+            if size is not None and tested >= size:
+                out[name] = (f"all {size} configuration{'' if size == 1 else 's'} of this family have been tested"
+                             + (" (it takes no parameters)" if size == 1 and not (self.family_meta.get(name) or {}) else ""))
+                continue
+            recent_duplicates = duplicates.get(name, 0)
+            if threshold > 0 and recent_duplicates >= threshold:
+                out[name] = (f"{recent_duplicates} duplicate proposal{'' if recent_duplicates == 1 else 's'} "
+                             f"since it last produced a new candidate (clears {cooldown:g}h after the last one)")
+        return out
 
     def state_context(self) -> dict[str, Any]:
         strategy_counts = self.db.strategy_counts()
@@ -2009,7 +2168,14 @@ class Supervisor:
         # THE WHOLE REGISTRY is in rotation, not a hand-typed list: the v2
         # mission named ten modes and 25 of 35 families were never scheduled in
         # 705 evaluations while tsmom was scheduled 151 times.
-        pool = [name for name in list(self.families) + ["generated_spec"] if name not in exclude]
+        exhausted = self.exhausted()
+        # An exhausted family is removed from the pool outright rather than
+        # merely penalised. A penalty is worthless when the family is the only
+        # eligible member of its mode: `control_always_long` was picked 40 times
+        # in a row on 2026-09-06 while carrying the maximum duplicate penalty,
+        # because nothing else in the control mode was eligible.
+        pool = [name for name in list(self.families) + ["generated_spec"]
+                if name not in exclude and name not in exhausted]
         saturated = self.saturation()
         FAILURE_WEIGHT = 10.0
 
@@ -2050,8 +2216,10 @@ class Supervisor:
                     reason = f"mode {mode} is {deficit[mode]:+.0%} below its quota"
                     break
         if target is None:
+            # generated_spec is never saturated and never exhausted, so this is
+            # a real fallback and not a hope.
             target = "generated_spec"
-            reason = "every family saturated"
+            reason = "every parameter family is saturated or exhausted"
         calibration = self.load_calibration()
         return {
             "counts": self.db.counts(),
@@ -2067,6 +2235,7 @@ class Supervisor:
                 "strategy": target,
                 "reason": reason,
                 "saturated": sorted(name for name, flag in saturated.items() if flag),
+                "exhausted": exhausted,
                 "quota_deficit": deficit,
                 "instruction": f"Try {target} next; do not repeat a better-tested family unless the mechanism is materially different.",
             },
@@ -2738,6 +2907,48 @@ class Supervisor:
         summary = self.evaluate_candidate(candidate["candidate_id"])
         return {"candidate_id": candidate["candidate_id"], **summary}
 
+    def run_iteration(self, iteration: int, max_reroutes: int = 3) -> dict[str, Any]:
+        """One iteration, rerouting past a family that cannot produce a new configuration.
+
+        A duplicate used to end the iteration: the daemon slept its interval,
+        the scheduler re-picked the same family (nothing had changed, because a
+        duplicate records no candidate and the quota deficit is measured in
+        recorded candidates), and twenty of those opened the circuit breaker.
+
+        Now the duplicate is recorded, which marks the family exhausted, the
+        scheduler picks a different one, and the iteration carries on. The cost
+        of a duplicate is one model call instead of one iteration. If the
+        scheduler cannot move - the same focus comes back - the duplicate is
+        raised to the caller rather than looping.
+        """
+        for attempt in range(max_reroutes + 1):
+            focus = self.state_context()["next_search_focus"]["strategy"]
+            self.write_heartbeat("proposing", iteration, focus=focus)
+            self.trace.emit(
+                "iteration.start" if attempt == 0 else "iteration.reroute",
+                iteration=iteration, focus=focus, attempt=attempt,
+            )
+            try:
+                return self.run_once(evaluate=True)
+            except DuplicateProposal as error:
+                rerouted = self.state_context()["next_search_focus"]
+                exhausted = self.exhausted().get(focus, "no new configuration available")
+                self.db.event("focus_rerouted", {
+                    "iteration": iteration,
+                    "attempt": attempt + 1,
+                    "from_focus": focus,
+                    "to_focus": rerouted["strategy"],
+                    "why_exhausted": exhausted,
+                    "reason": str(error),
+                }, error.candidate_id)
+                self.trace.emit(
+                    "iteration.duplicate", iteration=iteration, attempt=attempt + 1,
+                    from_focus=focus, to_focus=rerouted["strategy"], why_exhausted=exhausted,
+                )
+                if attempt >= max_reroutes or rerouted["strategy"] == focus:
+                    raise
+        raise SupervisorError("run_iteration exhausted its reroutes without a result")
+
     def review_candidate(self, candidate_id: str) -> dict[str, Any]:
         row = self.db.candidate(candidate_id)
         if row is None:
@@ -2806,11 +3017,8 @@ class Supervisor:
                     self.write_heartbeat("paused", iteration, last_candidate_id, str(error))
                     print(json.dumps({"iteration": iteration, "status": "paused", "reason": str(error)}), flush=True)
                     break
-                focus = self.state_context()["next_search_focus"]["strategy"]
-                self.write_heartbeat("proposing", iteration, focus=focus)
-                self.trace.emit("iteration.start", iteration=iteration, focus=focus)
                 try:
-                    result = self.run_once(evaluate=True)
+                    result = self.run_iteration(iteration)
                     if result.get("status") == "survives_development":
                         try:
                             review = self.review_candidate(result["candidate_id"])
@@ -2827,12 +3035,13 @@ class Supervisor:
                     self.write_heartbeat("idle", iteration, last_candidate_id)
                     print(json.dumps({"iteration": iteration, "status": "skipped", "reason": str(error)}), flush=True)
                 except DuplicateProposal as error:
+                    # Every reroute this iteration also came back a duplicate.
                     self.db.event(
                         "iteration_skipped",
                         {
                             "reason": str(error),
                             "iteration": iteration,
-                            "focus": focus,
+                            "focus": error.strategy,
                             "candidate_id": error.candidate_id,
                         },
                         error.candidate_id,
@@ -2929,7 +3138,7 @@ def classify_results(results: list[dict[str, Any]], incumbent: list[dict[str, An
             summary["worst_drawdown_pct"] <= summary["incumbent_worst_drawdown_pct"]
         )
         # Risk reducer: not a Sharpe improvement, but the same or nearly the
-        # same return per unit of risk at half the drawdown. The live book's
+        # same return per unit of risk at half the drawdown. The reference rule's
         # own justification is drawdown, not alpha, so this deserves a label
         # rather than "gate failed".
         summary["risk_reducer"] = (

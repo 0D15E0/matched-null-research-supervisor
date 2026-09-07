@@ -27,7 +27,7 @@ flowchart TB
 | layer | responsibility | key functions |
 |---|---|---|
 | CLI | parse flags, take the single-instance lock, dispatch | `main`, `build_parser` |
-| Supervisor | the iteration: schedule a focus (quotas, saturation), get a proposal, validate, reject repeats, evaluate, classify, review, checkpoint | `Supervisor.daemon`, `run_once`, `generate_proposal`, `state_context`, `novelty_rejection` |
+| Supervisor | the iteration: schedule a focus (quotas, saturation), get a proposal, validate, reject repeats, evaluate, classify, review, checkpoint | `Supervisor.daemon`, `run_iteration`, `run_once`, `generate_proposal`, `state_context`, `exhausted`, `novelty_rejection` |
 | Prompt builder | pure function from ledger facts to (system, user) text | `generator_prompts`, `leaf_reference_lines`, `spec_rule_defs` |
 | Validators | reject anything the mission or the evaluator cannot accept, before it costs a backtest | `validate_mission`, `validate_proposal`, `validate_generated_spec`, `normalize_spec_node` |
 | OllamaClient | the only network code; loopback URL, proxy bypass, redirect refusal, exponential backoff | `OllamaClient.chat`, `tags` |

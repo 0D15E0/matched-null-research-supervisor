@@ -16,10 +16,34 @@ The supervisor uses Ollama on `127.0.0.1:11434` to propose and review trading
 hypotheses. It does not replace the deterministic C++ backtester, and it has no
 permission to access holdout data, edit live deployment files, or place orders.
 
+## Where the incumbent came from
+
+This loop did not start with a model. It started with the CLI used by hand:
+fetching candles, validating stores, and backtesting one idea at a time, the
+way anyone would. That manual phase grew into the sibling repository's
+tournaments — twenty-four strategy families, roughly 53,000 candidates, with
+coin-flip controls bred alongside them — and the result was a clean negative:
+out of sample, nothing reliably beat holding the coins, and in-sample rank
+predicted nothing among the plausible ideas.
+
+What was left standing was arithmetic rather than a forecast: volatility-
+targeted sizing, diversification across coins, and a trend filter whose value
+is the drawdown it avoids. Since *which* trend rule barely mattered, the
+survivor was a majority vote of three published rules at their defaults:
+`ensemble_vote` with `enterVotes=2, exitVotes=0`.
+
+That rule is the **incumbent** here. Every proposal the loop generates is
+evaluated by the same engine, on the same folds, at the same costs, and asked
+one question: does it beat the incumbent? So far nothing has done so robustly;
+[docs/FINDINGS.md](docs/FINDINGS.md) keeps the score. The full account of how
+the incumbent was chosen is the sibling repository's
+[STRATEGY.md](https://github.com/0D15E0/matched-null_cli_trader_bot/blob/main/docs/STRATEGY.md).
+
 ## Start here
 
 - [Documentation: how it works, the loop, the CLI contract, the rule language](docs/README.md)
 - [Research plan](LOCAL_OLLAMA_RESEARCH_PLAN.md)
+- [What the loop has found](docs/FINDINGS.md)
 - [Operations runbook](RUNBOOK.md)
 - [Active TODO](TODO.md)
 - [Generator agent contract](agents/GENERATOR.md)
@@ -57,13 +81,13 @@ spec-novelty gates). The v1 ledger is archived and not mixed with v2/v3/v4 evide
 The current candidates are research evidence only. Promotion is now blocked by
 the incumbent-relative and null-calibrated gates unless a candidate clears both.
 
-The v4 null calibration is stored in `state/null-calibration-v4.json`. The first
-200-seed calibration produced these development-only 99th-percentile gates:
+The null calibration is stored under `state/` (gitignored; rebuild it with
+`calibrate-null`). It runs 200 `control_random` seeds through the same folds
+and records the 99th-percentile gates a candidate has to clear. Read the
+current values from that file rather than from prose: the numbers previously
+quoted here had drifted from the ones the loop was actually enforcing.
 
-- mean excess Sharpe versus the basket: `0.4139`;
-- worst-fold excess Sharpe versus the basket: `0.0111`.
-
-A candidate must also beat the deployed `ensemble_vote` on mean and worst-fold
+A candidate must also beat the incumbent `ensemble_vote` on mean and worst-fold
 Sharpe, with no worse worst-fold drawdown, before it can be marked `frontier`.
 `frontier` still means research frontier only; it is not permission to use the
 holdout or deploy.
@@ -141,7 +165,7 @@ checking a stopped or crashed run.
 Status meanings:
 
 - `survives_development`: passes the basket-relative development screen;
-- `frontier`: also beats the deployed incumbent on mean and worst-fold Sharpe,
+- `frontier`: also beats the incumbent on mean and worst-fold Sharpe,
 	stays within its worst drawdown, and clears the null's 99th-percentile gates;
 - `blocked_missing_feature`: a creative idea is waiting for a human-supplied
 	local feature manifest.

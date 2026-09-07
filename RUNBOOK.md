@@ -223,7 +223,7 @@ The daemon:
 3. asks local Ollama for one proposal;
 4. validates the proposal or records it as invalid;
 5. evaluates valid candidates on the fixed development folds;
-6. compares candidates with the deployed incumbent;
+6. compares candidates with the incumbent;
 7. applies the calibrated null gate;
 8. reviews survivors locally;
 9. writes SQLite/artifact checkpoints;

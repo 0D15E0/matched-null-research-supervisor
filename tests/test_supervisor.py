@@ -1,10 +1,16 @@
 import json
+import datetime as dt
+import tempfile
 import unittest
+from pathlib import Path
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from supervisor import (
     DEFAULT_MISSION,
+    Registry,
+    Supervisor,
+    enumerable_space_size,
     MIN_TREND_WINDOW,
     is_saturated,
     normalized_parameters,
@@ -435,6 +441,193 @@ Avg pairwise sleeve correlation: nan
         self.assertIsNone(metrics["sleeve_correlation"])
         summary = classify_results([metrics, metrics, metrics], None, None)
         self.assertEqual(summary["classification"], "zero_trade_fold")
+
+    # ------------------------------------------------------------------
+    # Exhaustion: a family that cannot produce a new configuration must leave
+    # the rotation. Regression for 2026-09-06, when control_always_long (no
+    # parameters, one configuration, already tested) was scheduled 40 times in
+    # a row and opened the duplicate circuit breaker three times.
+    # ------------------------------------------------------------------
+
+    def test_enumerable_space_size(self):
+        self.assertEqual(enumerable_space_size({}), 1)                       # no parameters: one configuration
+        grid = {"enterVotes": {"lo": 1, "hi": 3, "is_int": True}, "exitVotes": {"lo": 0, "hi": 2, "is_int": True}}
+        self.assertEqual(enumerable_space_size(grid), 9)
+        continuous = {"bandPct": {"lo": 0.0, "hi": 5.0, "is_int": False}}
+        self.assertIsNone(enumerable_space_size(continuous))
+        huge = {"seed": {"lo": 1, "hi": 100000, "is_int": True}}
+        self.assertIsNone(enumerable_space_size(huge))
+
+    def _supervisor(self, families, family_meta, tmp):
+        """A Supervisor with only the attributes the scheduler touches."""
+        supervisor = Supervisor.__new__(Supervisor)
+        supervisor.mission = self.mission
+        supervisor.families = families
+        supervisor.family_meta = family_meta
+        supervisor.db = Registry(Path(tmp) / "t.sqlite3")
+        supervisor.calibration_path = Path(tmp) / "missing.json"
+        return supervisor
+
+    def _record(self, supervisor, strategy, sparams="", ident=None):
+        ident = ident or f"cand-{strategy}-{sparams or 'default'}"
+        supervisor.db.insert_candidate({
+            "candidate_id": ident, "proposal_hash": ident, "config_hash": ident,
+            "mission_id": self.mission["mission_id"],
+            "proposal": {"strategy": strategy, "sparams": sparams, "proposal_type": "family"},
+        })
+        supervisor.db.event("proposal_recorded", {"strategy": strategy}, ident)
+
+    def test_parameterless_family_is_exhausted_by_its_only_configuration(self):
+        families = {"control_always_long": {}, "faber_ma": {"window": (20.0, 400.0)}}
+        meta = {"control_always_long": {}, "faber_ma": {"window": {"lo": 20, "hi": 400, "is_int": True}}}
+        with tempfile.TemporaryDirectory() as tmp:
+            supervisor = self._supervisor(families, meta, tmp)
+            self.assertEqual(supervisor.exhausted(), {})            # untested: still worth one run
+            self._record(supervisor, "control_always_long")
+            exhausted = supervisor.exhausted()
+            self.assertIn("control_always_long", exhausted)
+            self.assertIn("takes no parameters", exhausted["control_always_long"])
+            self.assertNotIn("faber_ma", exhausted)                 # 381 windows, one tested
+            supervisor.db.close()
+
+    def test_one_duplicate_exhausts_until_a_new_candidate_appears(self):
+        families = {"faber_ma": {"window": (20.0, 400.0)}}
+        meta = {"faber_ma": {"window": {"lo": 20, "hi": 400, "is_int": True}}}
+        with tempfile.TemporaryDirectory() as tmp:
+            supervisor = self._supervisor(families, meta, tmp)
+            self._record(supervisor, "faber_ma", "window=200")
+            self.assertEqual(supervisor.exhausted(), {})
+            supervisor.db.event("duplicate_proposal", {"strategy": "faber_ma"})
+            self.assertIn("faber_ma", supervisor.exhausted())       # routed away on the FIRST duplicate
+            self._record(supervisor, "faber_ma", "window=120")      # a new configuration clears it
+            self.assertEqual(supervisor.exhausted(), {})
+            supervisor.db.close()
+
+    def test_duplicate_exhaustion_expires_so_a_family_is_not_retired_forever(self):
+        """An excluded family cannot record the candidate that would clear it, so the
+        duplicate cooldown must expire on its own."""
+        families = {"faber_ma": {"window": (20.0, 400.0)}}
+        meta = {"faber_ma": {"window": {"lo": 20, "hi": 400, "is_int": True}}}
+        with tempfile.TemporaryDirectory() as tmp:
+            supervisor = self._supervisor(families, meta, tmp)
+            self._record(supervisor, "faber_ma", "window=200")
+            supervisor.db.event("duplicate_proposal", {"strategy": "faber_ma"})
+            self.assertIn("faber_ma", supervisor.exhausted())
+            stale = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=48)).replace(microsecond=0).isoformat()
+            supervisor.db.db.execute("UPDATE events SET created_at=? WHERE event_type='duplicate_proposal'", (stale,))
+            supervisor.db.db.commit()
+            self.assertEqual(supervisor.exhausted(), {})            # cooldown expired: back in rotation
+            supervisor.db.close()
+
+    def test_scheduler_leaves_a_starved_mode_instead_of_repeating_it(self):
+        """The exact dead end: the only eligible control cannot produce a new configuration.
+
+        A duplicate records no candidate, so the control quota deficit never
+        shrinks and the mode keeps winning. The scheduler must drop the mode.
+        """
+        families = {"control_always_long": {}, "faber_ma": {"window": (20.0, 400.0)}}
+        meta = {"control_always_long": {}, "faber_ma": {"window": {"lo": 20, "hi": 400, "is_int": True}}}
+        with tempfile.TemporaryDirectory() as tmp:
+            supervisor = self._supervisor(families, meta, tmp)
+            self._record(supervisor, "control_always_long")
+            for window in (60, 90, 120, 150):                        # families are over-represented
+                self._record(supervisor, "faber_ma", f"window={window}")
+            focus = supervisor.state_context()["next_search_focus"]
+            self.assertNotEqual(focus["strategy"], "control_always_long")
+            self.assertIn("control_always_long", focus["exhausted"])
+            supervisor.db.close()
+
+    def test_generated_spec_is_never_saturated_or_exhausted(self):
+        families = {"faber_ma": {"window": (20.0, 400.0)}}
+        meta = {"faber_ma": {"window": {"lo": 20, "hi": 400, "is_int": True}}}
+        with tempfile.TemporaryDirectory() as tmp:
+            supervisor = self._supervisor(families, meta, tmp)
+            for index in range(40):                                  # a long flat run of specs
+                supervisor.db.insert_candidate({
+                    "candidate_id": f"cand-spec-{index}", "proposal_hash": f"h{index}", "config_hash": f"c{index}",
+                    "mission_id": self.mission["mission_id"],
+                    "proposal": {"strategy": "generated_spec", "sparams": "", "proposal_type": "generated_spec"},
+                })
+                supervisor.db.update_candidate(f"cand-spec-{index}", "killed", "basket_screen_failed",
+                                               {"mean_excess_sharpe_vs_incumbent": 0.1})
+            supervisor.db.event("duplicate_proposal", {"strategy": "generated_spec"})
+            self.assertNotIn("generated_spec", supervisor.saturation())
+            self.assertNotIn("generated_spec", supervisor.exhausted())
+            supervisor.db.close()
+
+    def test_run_iteration_reroutes_past_a_duplicate_instead_of_burning_the_iteration(self):
+        """One duplicate must cost one model call, not a whole iteration.
+
+        Before the fix a duplicate ended the iteration, the daemon slept its
+        interval, and the scheduler re-picked the same family, because a
+        duplicate records no candidate and so cannot reduce the quota deficit
+        that selected it. Forty of those ran in a row on 2026-09-06.
+
+        `faber_ma` here has a large parameter space, so it is NOT statically
+        exhausted: it becomes ineligible only once it has actually duplicated,
+        which is the path the reroute has to handle.
+        """
+        from supervisor import DuplicateProposal, TraceLogger
+        families = {"faber_ma": {"window": (20.0, 400.0)}, "kama_trend": {"erWindow": (5.0, 100.0)}}
+        meta = {"faber_ma": {"window": {"lo": 20, "hi": 400, "is_int": True}},
+                "kama_trend": {"erWindow": {"lo": 5, "hi": 100, "is_int": True}}}
+        with tempfile.TemporaryDirectory() as tmp:
+            supervisor = self._supervisor(families, meta, tmp)
+            supervisor.trace = TraceLogger(None)
+            supervisor.heartbeat_path = Path(tmp) / "hb.json"
+            supervisor.model, supervisor.reviewer_model, supervisor.mission_hash = "m", "r", "h"
+            self._record(supervisor, "faber_ma", "window=200")
+            self._record(supervisor, "kama_trend", "erWindow=20")     # kama is better tested...
+            self._record(supervisor, "kama_trend", "erWindow=40")     # ...so faber_ma is picked first
+            calls = []
+
+            def fake_run_once(evaluate: bool):
+                focus = supervisor.state_context()["next_search_focus"]["strategy"]
+                calls.append(focus)
+                if focus == "faber_ma":
+                    supervisor.db.event("duplicate_proposal", {"strategy": focus}, "cand-faber_ma-window=200")
+                    raise DuplicateProposal("duplicate candidate configuration", "cand-faber_ma-window=200", focus)
+                return {"candidate_id": "cand-new", "status": "survives_development"}
+
+            supervisor.run_once = fake_run_once
+            supervisor.search_policy = lambda: {
+                "quotas": {"family": 1.0}, "quota_window": 100, "exclude": [],
+                "saturation": {"min_evaluations": 30, "window": 20, "min_improvement": 0.10, "drift_every": 0},
+                "near_duplicate_distance": 0.10, "spec_novelty": {"leaf_cap_share": 0.4, "leaf_cap_window": 30},
+                "exhaust_after_duplicates": 1, "exhaust_duplicate_hours": 6.0, "preferred_sequence": [],
+            }
+            result = supervisor.run_iteration(iteration=1)
+            self.assertEqual(result["candidate_id"], "cand-new")      # the iteration still produced a candidate
+            self.assertEqual(calls[0], "faber_ma")                    # it duplicated once...
+            self.assertEqual(calls[1], "kama_trend")                  # ...and the next call went elsewhere
+            self.assertEqual(len(calls), 2)
+            self.assertIn("faber_ma", supervisor.exhausted())
+            rerouted = supervisor.db.db.execute(
+                "SELECT COUNT(*) FROM events WHERE event_type='focus_rerouted'").fetchone()[0]
+            self.assertEqual(rerouted, 1)
+            supervisor.db.close()
+
+    def test_run_iteration_gives_up_when_the_scheduler_cannot_move(self):
+        """If the reroute would land on the same focus, raise rather than loop."""
+        from supervisor import DuplicateProposal, TraceLogger
+        families = {"faber_ma": {"window": (20.0, 400.0)}}
+        meta = {"faber_ma": {"window": {"lo": 20, "hi": 400, "is_int": True}}}
+        with tempfile.TemporaryDirectory() as tmp:
+            supervisor = self._supervisor(families, meta, tmp)
+            supervisor.trace = TraceLogger(None)
+            supervisor.heartbeat_path = Path(tmp) / "hb.json"
+            supervisor.model, supervisor.reviewer_model, supervisor.mission_hash = "m", "r", "h"
+            calls = []
+
+            def always_duplicate(evaluate: bool):
+                calls.append(supervisor.state_context()["next_search_focus"]["strategy"])
+                raise DuplicateProposal("duplicate candidate configuration", "cand-x", "faber_ma")
+
+            supervisor.run_once = always_duplicate
+            with self.assertRaises(DuplicateProposal):
+                supervisor.run_iteration(iteration=1, max_reroutes=3)
+            self.assertLessEqual(len(calls), 4)                        # bounded, never an inner loop
+            supervisor.db.close()
 
     def test_frontier_requires_incumbent_and_null_gates(self):
         candidate = [

@@ -65,7 +65,7 @@ What each flag means, and why the value is what it is:
 
 | flag | value | why |
 |---|---|---|
-| `--envs` | the four protocol coins at 4h | the repository's frozen research universe; the eight-coin book cannot run the 2018-19 and 2020-21 folds because two coins start in 2022 |
+| `--envs` | the four protocol coins at 4h | the repository's frozen research universe; the eight-coin descriptive universe cannot run the 2018-19 and 2020-21 folds because two coins start in 2022 |
 | `--start/--end` | one of three fixed folds | chronological development folds; the builder refuses any end after `development_end` |
 | `--warmup-bars 600` | mission `evaluation.warmup_bars` | indicators warm up on bars before `--start` that are neither traded nor scored; 600 covers the longest window a spec may ask for |
 | `--vol-target 0.2` | mission | positions sized to 20% annualised volatility; fixed because the vol target is a leverage dial and would otherwise dominate every comparison |

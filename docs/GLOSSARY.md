@@ -9,7 +9,7 @@
 | **fold** | one of three fixed two-year windows: 2018-19, 2020-21, 2022-23, each with a 600-bar causal warm-up |
 | **basket** | equal-weight buy-and-hold of the four protocol coins over the same window, with the same costs; the benchmark every fold is measured against |
 | **excess Sharpe vs basket** | portfolio Sharpe minus basket Sharpe on a fold; the repository's primary metric |
-| **incumbent** | `ensemble_vote enterVotes=2,exitVotes=0`, the rule the live book runs, evaluated through the identical commands; the bar a candidate must clear |
+| **incumbent** | `ensemble_vote enterVotes=2,exitVotes=0`, the rule that manual experimentation and the sibling repository's tournaments left standing, and the reference this mission measures against, evaluated through the identical commands; the bar a candidate must clear |
 | **excess Sharpe vs incumbent** | candidate fold Sharpe minus incumbent fold Sharpe; `mean_excess_sharpe_vs_incumbent` is the loop's ranking metric |
 | **null calibration** | 200 seeds of `control_random` through the folds; its 99th-percentile mean and worst excess Sharpe vs basket are the null gate |
 | **frontier** | beats the incumbent (mean delta > 0, worst fold delta > −0.25, drawdown not worse) and beats the null. Research frontier only; not a deployment signal |
@@ -19,6 +19,7 @@
 | **config hash** | SHA-256 of the canonical configuration; the candidate id and the duplicate key |
 | **mission** | the JSON policy file; hashed at registration, re-checked at every start; a change is a new mission id. v4 shares v2's ledger and evaluation protocol and finalizes the search policy |
 | **saturated** | a family with 30+ scored evaluations whose best did not move by 0.10 over its last 20; scheduled only as a drift check |
+| **exhausted** | a family that cannot produce a new configuration: either its finite grid is fully recorded (permanent; a family with no parameters has a grid of one) or it duplicated since its last new candidate (a cooldown of `exhaust_duplicate_hours`). Removed from the rotation entirely, because a penalty is worthless when the family is the only eligible member of its mode |
 | **near-duplicate** | a family proposal within 10% of every parameter's legal range of a tested configuration; rejected before any backtest |
 | **structural repeat** | a spec whose entry and exit leaf-type sets match a tested spec; rejected before any backtest |
 | **quota** | the target share of recorded candidates per mode (spec, family, calendar, control), measured over the last 100 |
@@ -68,7 +69,9 @@
 | `doctor_pass` | startup checks passed (model installed and local, data present, hashes recorded) |
 | `proposal_request_error` | an Ollama request failed or returned no content; retried |
 | `invalid_proposal` | a model response was rejected; the artifact is `invalid-<hash>.json` |
-| `duplicate_proposal` | a valid proposal matched an existing config hash |
+| `duplicate_proposal` | a valid proposal matched an existing config hash, was a near-duplicate of a tested parameter set, or repeated a tested spec structure; the payload carries the reason |
+| `semantic_duplicate` | a near-duplicate or structural repeat, with the rejected model text saved to `artifacts-v2/duplicate-*.json` |
+| `focus_rerouted` | a duplicate made the scheduled family exhausted, so the iteration switched focus instead of ending; the payload carries the old focus, the new one, and why the old one was dropped |
 | `semantic_duplicate` | a valid proposal was a near-duplicate of a tested parameter set or repeated a tested spec structure |
 | `proposal_recorded` | a new candidate was stored |
 | `scheduled_creative_substitution`, `scheduled_feature_substitution` | the accepted proposal type differed from the scheduled focus in a permitted way |
@@ -81,6 +84,7 @@
 | `candidate_interrupted`, `candidate_recovered_interrupted` | see statuses |
 | `incumbent_summary_failed` | the incumbent backtest failed while building a prompt |
 | `review_recorded`, `invalid_review` | reviewer output stored, or rejected |
+| `proposal_revalidated_invalid` | a stored `proposed` candidate no longer validates under the current rules, found at startup |
 | `null_calibration_complete` | `calibrate-null` finished |
 | `circuit_breaker_open`, `daemon_paused` | a streak limit was hit and the daemon exited |
 

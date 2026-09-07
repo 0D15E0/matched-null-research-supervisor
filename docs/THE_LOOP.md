@@ -56,6 +56,27 @@ mission's `preferred_sequence` is only a tie-break order. (The v2 mission named
 ten modes by hand, and in 705 evaluations 25 of the 35 registry families were
 never scheduled while tsmom was scheduled 151 times.)
 
+The scheduler works in four steps:
+
+0. **Exhaustion.** A family that cannot produce a new configuration is removed
+   from the pool outright, not merely penalised. Two ways to qualify:
+   *permanently*, when the family's configuration grid is finite and every
+   point has been recorded (a family with no parameters spans exactly one
+   configuration, so it is exhausted the moment it is tested once); or on a
+   *cooldown*, when it has produced a duplicate since its last new candidate,
+   which expires after `exhaust_duplicate_hours` so a family whose space is
+   barely explored is not retired for good.
+
+   This step exists because of a real deadlock. `control_always_long` takes no
+   parameters, so its one configuration was tested and every later proposal for
+   it was an exact duplicate. A duplicate records no candidate, the quota
+   deficit is measured in *recorded* candidates, so the control mode stayed
+   starved and the scheduler re-picked the same family forever: forty times in
+   a row on 2026-09-06, opening the duplicate circuit breaker three times. A
+   penalty could not help, because the family was the only eligible member of
+   its mode. Four more parameterless families were one duplicate from the same
+   trap.
+
 The scheduler works in three steps:
 
 1. **Quotas by mode.** Each candidate belongs to a mode: `spec`
@@ -80,7 +101,16 @@ score(family) = candidates recorded for it
 ```
 
 The heartbeat carries the chosen focus and the scheduler's reason
-(`mode spec is +26% below its quota`, `drift check of a saturated family`).
+(`mode spec is +26% below its quota`, `drift check of a saturated family`), and
+`next_search_focus.exhausted` lists every family that is out and why.
+
+**A duplicate does not cost an iteration.** If a proposal is rejected as a
+duplicate, the rejection is recorded, which makes the scheduler treat that
+family as exhausted, and the iteration immediately reroutes to a different
+focus (up to three times, and never to the same focus twice). One duplicate
+therefore costs one model call instead of an iteration plus the poll interval.
+The reroute is logged as a `focus_rerouted` event carrying the old focus, the
+new one, and why the old one was dropped.
 
 `feature_request` is excluded unless the mission sets
 `search_policy.schedule_feature_requests`: it produces notes for a human, not
@@ -147,7 +177,7 @@ per-sleeve trade count. A fold that returns non-zero, times out, or prints a
 report the parser cannot read is an execution failure and the candidate is
 killed with the raw output kept.
 
-The incumbent (`ensemble_vote enterVotes=2,exitVotes=0`, the live book's rule)
+The incumbent (`ensemble_vote enterVotes=2,exitVotes=0`, the mission's reference rule)
 is run through the identical three commands once per process and cached.
 
 ## 6. Classification
@@ -181,7 +211,7 @@ Three numbers in that diagram are design choices and are worth knowing:
   percentile of mean and worst excess Sharpe versus the basket. The current
   v2 values are 0.42 and 0.21. A candidate below them is indistinguishable
   from a lucky random trader with the same sizing.
-- **Half the drawdown for `risk_reducer`.** The live book's own justification
+- **Half the drawdown for `risk_reducer`.** The reference rule's own justification
   is drawdown, not alpha; a rule that keeps the Sharpe and halves the drawdown
   deserves a label rather than "gate failed".
 
@@ -210,7 +240,8 @@ sleeps `--interval` seconds.
 | model returned no JSON or invalid JSON | `invalid_proposal` | none | retry, up to 3 |
 | Ollama request failed or returned empty content | `proposal_request_error` | none | retry with backoff, up to 3 |
 | three attempts failed | `scheduled_strategy_failed`, `iteration_skipped` | none | next iteration |
-| same configuration already tested (exact hash, after all attempts) | `duplicate_proposal`, `iteration_skipped` | none | next iteration |
+| same configuration already tested (exact hash) | `duplicate_proposal`, `focus_rerouted` | none | reroutes to another family inside the same iteration |
+| every reroute also duplicated | `duplicate_proposal`, `iteration_skipped` | none | next iteration |
 | near-duplicate parameters or structural repeat of a spec | `semantic_duplicate` | none | retry with the reason, up to 3 |
 | a fold failed or timed out | `candidate_classified` | `killed / execution_failed` | next iteration |
 | exception inside evaluation | `candidate_evaluation_exception` | `killed / evaluation_exception` | next iteration |
