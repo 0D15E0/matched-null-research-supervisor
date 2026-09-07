@@ -1,0 +1,167 @@
+{
+  "mission_id": "local-trend-discovery-v6",
+  "description": "Same universe, folds, costs, sizing, gates and incumbent as v2/v4/v5, and the same leaf vocabulary as v5. ONE change, and it is a correction rather than a widening: warmup_bars goes from 600 to 2100 so that every leaf and every family parameter is fully warm at the START of each fold. Under 600 bars a rule whose lookback exceeded the warm-up was undefined for the opening stretch of every fold - up to 27% of a two-year fold at a 1800-bar window - so its measured performance depended on its own parameter rather than on the market. Numbers for long-lookback families are therefore NOT comparable with v2/v4/v5; the incumbent's are, and were verified unchanged.",
+  "source_repo": "../cli_trader",
+  "data_policy": {
+    "development_end": "2023-12-31",
+    "holdout_start": "2024-01-01",
+    "allowed_data_dirs": [
+      "../cli_trader/data"
+    ],
+    "forbidden_paths": [
+      "../cli_trader/experiments/holdout.json",
+      "../cli_trader/state_live",
+      "../cli_trader/deploy"
+    ],
+    "allow_data_fetch": false
+  },
+  "allowed_commands": [
+    "portfolio",
+    "backtest",
+    "list-strategies",
+    "causality_check"
+  ],
+  "universe": {
+    "protocol_symbols": [
+      "BTC_USDT",
+      "ETH_USDT",
+      "XRP_USDT",
+      "LTC_USDT"
+    ],
+    "period_seconds": [
+      14400
+    ]
+  },
+  "evaluation": {
+    "folds": [
+      [
+        "2018-01-01",
+        "2019-12-31"
+      ],
+      [
+        "2020-01-01",
+        "2021-12-31"
+      ],
+      [
+        "2022-01-01",
+        "2023-12-31"
+      ]
+    ],
+    "warmup_bars": 2100,
+    "vol_target": 0.2,
+    "vol_window": 30,
+    "weights": "equal",
+    "vol_lookback": 120,
+    "rebalance": 30,
+    "min_trades_per_fold": 1,
+    "max_trades_per_fold": 1000,
+    "primary_metric": "mean_excess_sharpe_vs_incumbent",
+    "required_metrics": [
+      "sharpe",
+      "excess_sharpe_vs_basket",
+      "excess_sharpe_vs_incumbent",
+      "worst_fold_excess",
+      "max_drawdown",
+      "sleeve_correlation",
+      "trades"
+    ]
+  },
+  "incumbent": {
+    "strategy": "ensemble_vote",
+    "sparams": "enterVotes=2,exitVotes=0",
+    "description": "Current research incumbent; not an automatic deployment recommendation."
+  },
+  "search_policy": {
+    "preferred_sequence": [
+      "generated_spec",
+      "feature_request",
+      "calendar_rule",
+      "faber_ma",
+      "sma_cross",
+      "tsmom",
+      "ensemble_vote",
+      "donchian",
+      "control_random",
+      "control_always_long"
+    ],
+    "schedule_feature_requests": false,
+    "exclude": [
+      "ensemble_ls"
+    ],
+    "quotas": {
+      "spec": 0.5,
+      "family": 0.4,
+      "calendar": 0.05,
+      "control": 0.05
+    },
+    "quota_window": 100,
+    "saturation": {
+      "min_evaluations": 30,
+      "window": 20,
+      "min_improvement": 0.1,
+      "drift_every": 20
+    },
+    "near_duplicate_distance": 0.1,
+    "spec_novelty": {
+      "leaf_cap_share": 0.4,
+      "leaf_cap_window": 30
+    },
+    "trend_window_floor_bars": 12,
+    "external_feature_policy": "proposal_only_until_a_local_feature_manifest_exists",
+    "notes": [
+      "preferred_sequence is only a tie-break order now; every compatible family the binary lists is schedulable",
+      "ensemble_ls is excluded because it requires --long-short while this mission evaluates long-only portfolios",
+      "quotas are measured over the last quota_window recorded candidates; the mode furthest below its share is scheduled",
+      "a family is saturated when >= min_evaluations were scored and the best over all did not beat the best before the last window by min_improvement; it then gets one drift check every drift_every candidates",
+      "near_duplicate_distance is the L-infinity distance between parameter vectors normalised to [0,1] over each legal range",
+      "measured 2026-09-06 on the v2 ledger: 151 tsmom parameter sets with best +0.27, indistinguishable from the best of 106 coin-flip controls (+0.26); 25 of 35 families never scheduled",
+      "v5: memory_order_* is a regime gate, not an entry trigger. It is causal (window [i-w+1, i]), reads the median order over three small radii because spiral.h is explicit that one radius is not a measurement, and refits every max(10, window/40) bars on a DERIVED cadence so it adds no searchable knob. The earlier manual test of this idea (cli_trader/experiments/order_gate) ranked instruments on full-sample spectra and is explicitly not tradeable; this leaf tests the weaker causal claim instead.",
+      "measured before adding it: alpha runs about -0.8..+1.1 on 4h crypto with a median near -0.2, i.e. in the fractional band -1 < alpha < 0; the threshold range [-1.5,1.0] brackets that and the window floor of 300 bars is what the estimator needs to see a power-law tail at all",
+      "v6 measurement, 4 protocol coins, warm-up 600 vs 2100: the incumbent is IDENTICAL in every fold (0.09 / 2.22 / 0.29), and so is tsmom - anything warm within 600 bars is unaffected, so the comparison baseline is stable. What moves is exactly what should: vr_switch at vrWindow=800 loses 0.06 and 0.23 Sharpe in the two folds checked, vol_managed at rankWindow=750 loses 0.02 and 0.09. Those two were being flattered by sitting out the opening of each fold. This flaw predates the memory_order leaf; the leaf only made it visible.",
+      "v6 also removes a prompt artifact: v5 told the model the memory_order window 'MUST BE 300-2000 bars, far longer than the other leaves', and the model duly picked a median of 1200, which under the 600-bar warm-up blinded the leaf for a fifth of every fold. Measured zero-trade rate by window under v5: 0% at 300-600, 33% at 1001-1500, 42% at 1501-2000, against 10% for specs without the leaf. The prompt now states what the window actually controls - regime cadence, about 35-day regimes at 500 bars and about 100-day at 1500 - instead of urging length for its own sake.",
+      "checked before adopting: a 2100-bar warm-up reaches back to 2017-01-16 from the first fold, which stays clear of the thin carried-forward XRP/LTC bars of 2015-16 that inflate any statistic read across them."
+    ]
+  },
+  "null_calibration": {
+    "strategy": "control_random",
+    "seeds": 200,
+    "required_before_promotion": true
+  },
+  "limits": {
+    "max_parameters": 12,
+    "max_candidate_runtime_seconds": 900,
+    "max_invalid_proposals_in_a_row": 20,
+    "max_duplicate_proposals_in_a_row": 20,
+    "max_source_edits": 0
+  },
+  "permissions": {
+    "allow_holdout": false,
+    "allow_deployment": false,
+    "allow_source_edits": false
+  },
+  "spec_leaf_vocabulary": [
+    "atr_trailing_stop",
+    "breakdown_below",
+    "breakout_above",
+    "close_above_ema",
+    "close_above_sma",
+    "close_below_ema",
+    "close_below_sma",
+    "green_candle",
+    "market_zscore_above",
+    "market_zscore_below",
+    "memory_order_above",
+    "memory_order_below",
+    "red_candle",
+    "relative_volume_above",
+    "return_above",
+    "return_below",
+    "rsi_above",
+    "rsi_below",
+    "vol_rank_above",
+    "vol_rank_below",
+    "weekday",
+    "zscore_return_above",
+    "zscore_return_below"
+  ]
+}

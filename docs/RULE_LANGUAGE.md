@@ -45,6 +45,7 @@ threshold's unit differs per leaf, and this table is sent to the model in every
 | `relative_volume_above` | window, threshold | this bar's volume over the prior-window mean; 2 is twice normal; range 0..20 |
 | `vol_rank_above`, `vol_rank_below` | window, threshold, `rank_window`? (default 250) | percentile 0..1 of realised volatility within its own trailing history |
 | `market_zscore_above`, `market_zscore_below` | window, threshold, `vol_window`? | the same z-score computed on BTC_USDT, the market factor, read one bar late. The only leaf that uses information from outside the traded coin |
+| `memory_order_above`, `memory_order_below` | window (300..2000), threshold (−1.5..1.0) | Order α of the trailing volatility autocorrelation, estimated causally by the logarithmic-spiral method over `window` bars. α ≈ −1 is an integer order (exponential relaxation, ARMA-like); −1 < α < 0 is fractional (power-law memory). A **regime gate**, not an entry trigger |
 | `atr_trailing_stop` | window, threshold | ATR multiple k. True while a position is open and close < highest close since entry − k·ATR(window). Range 0.5..10. Meaningful in `exit` only; in `entry` it is always false |
 | `weekday` | day | 0..6 in UTC, Sunday = 0 |
 | `green_candle`, `red_candle` | none | close above, or below, open |
@@ -52,6 +53,36 @@ threshold's unit differs per leaf, and this table is sent to the model in every
 Secondary windows are accepted only on the leaves listed for them. A
 `vol_window` on an RSI leaf is rejected by both the supervisor and the
 executor, so a stray field can never silently change what a rule means.
+
+
+## The memory-order leaf, and what it is not
+
+`memory_order_*` is the only leaf backed by an estimator expensive enough to
+need care, and the only one whose window bounds differ from the rest. Three
+design points, because each is a place it could quietly become dishonest.
+
+**It is causal, and the earlier version of this idea was not.** The estimate at
+bar *i* uses closes in `[i-window+1, i]` only. The sibling repository's manual
+experiment (`experiments/order_gate/`) ranked instruments on **full-sample**
+spectra, which is why its own README says the shortlist is not an out-of-sample
+result and must not be traded. This leaf tests a different, weaker, honest
+claim: that memory order measured *so far* says something about what happens
+next.
+
+**It never reads a single radius.** `math/spiral.h` is explicit that one radius
+is not a measurement, because every model looks wrong at large radius. The leaf
+takes the median α over the three small radii the gate experiment's
+identification statistic uses.
+
+**Its refit cadence is derived, not searchable.** The estimator is far too slow
+to run per bar, so it refits every `max(10, window/40)` bars and holds the value
+between refits. Making that a parameter would add a knob to a statistic already
+noisy enough to overfit, for no hypothesis anyone holds. Memory order is a slow
+structural property; on 4h bars a 500-bar window refits about every two days.
+
+Measured on this repository's stores, α runs roughly −0.8 to +0.7 with a median
+near −0.2, i.e. squarely in the fractional band. A threshold outside that range
+gates nothing, which is why the validator bounds it to [−1.5, 1.0].
 
 ## Example
 

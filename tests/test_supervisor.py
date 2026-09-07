@@ -8,6 +8,10 @@ from tempfile import TemporaryDirectory
 
 from supervisor import (
     DEFAULT_MISSION,
+    SupervisorError,
+    validate_mission,
+    spec_rule_defs,
+    validate_generated_spec,
     Registry,
     Supervisor,
     enumerable_space_size,
@@ -324,6 +328,92 @@ class SupervisorTests(unittest.TestCase):
         with self.assertRaisesRegex(Exception, "ATR multiple"):
             validate_proposal(proposal, self.mission, self.families)
 
+    def test_warmup_must_cover_every_leaf_window(self):
+        """A leaf may not out-run the warm-up, or it is blind at each fold's start.
+
+        Under v5 (600 warm-up, 2000-bar leaf ceiling) memory_order was undefined
+        for up to 27% of every two-year fold, so a rule's measured performance
+        depended on its own window rather than on the market. The active mission
+        must warm up at least as long as the widest leaf window it allows.
+        """
+        mission = validate_mission(DEFAULT_MISSION)
+        warmup = mission["evaluation"]["warmup_bars"]
+        for name, spec in LEAF_SPEC.items():
+            bounds = spec.get("window_range")
+            if bounds:
+                self.assertLessEqual(bounds[1], warmup,
+                                     f"{name} allows {bounds[1]} bars but the mission warms up {warmup}")
+        active = json.loads(DEFAULT_MISSION.read_text())
+        too_short = dict(active)
+        too_short["evaluation"] = dict(active["evaluation"], warmup_bars=600)
+        with TemporaryDirectory(dir=str(DEFAULT_MISSION.parent)) as tmp:
+            path = Path(tmp) / "short_warmup.json"
+            path.write_text(json.dumps(too_short))
+            with self.assertRaises(SupervisorError):
+                validate_mission(path)
+
+    def test_mission_pins_the_spec_leaf_vocabulary(self):
+        """A change to the rule language must force a new mission id.
+
+        The mission file is hash-guarded, but LEAF_SPEC lives in code: widening
+        it without a new mission would silently pool candidates drawn from two
+        different search spaces. The active mission therefore pins the leaf set
+        and validate_mission enforces the match.
+        """
+        active = json.loads(DEFAULT_MISSION.read_text())
+        self.assertEqual(sorted(active["spec_leaf_vocabulary"]), sorted(LEAF_SPEC),
+                         "the active mission's pinned vocabulary has drifted from LEAF_SPEC")
+        validate_mission(DEFAULT_MISSION)
+        with TemporaryDirectory(dir=str(DEFAULT_MISSION.parent)) as tmp:
+            for label, vocab in (("a leaf added in code", active["spec_leaf_vocabulary"][:-1]),
+                                 ("a leaf removed in code", active["spec_leaf_vocabulary"] + ["invented_leaf"])):
+                drifted = dict(active, spec_leaf_vocabulary=vocab)
+                path = Path(tmp) / "drifted.json"
+                path.write_text(json.dumps(drifted))
+                with self.assertRaises(SupervisorError, msg=label):
+                    validate_mission(path)
+        # a mission that pins nothing stays valid, so older missions still load
+        unpinned = dict(active)
+        unpinned.pop("spec_leaf_vocabulary")
+        with TemporaryDirectory(dir=str(DEFAULT_MISSION.parent)) as tmp:
+            path = Path(tmp) / "unpinned.json"
+            path.write_text(json.dumps(unpinned))
+            validate_mission(path)
+
+    def test_memory_order_leaf_has_its_own_window_range(self):
+        """The order estimator needs a long window; ordinary leaves must stay capped.
+
+        This is the one leaf whose window bounds differ from every other, so a
+        regression here would either fee-kill it (capped at 600, too short for a
+        power-law tail) or silently let a 2000-bar SMA through.
+        """
+        def leaf(**kw):
+            base = {"type": "memory_order_above", "window": 500, "threshold": -0.2}
+            base.update(kw)
+            return {"entry": {"all": [base]},
+                    "exit": {"any": [{"type": "close_below_sma", "window": 50, "threshold": 0.0}]}}
+        validate_generated_spec(leaf(), 8)
+        validate_generated_spec(leaf(window=300), 8)
+        validate_generated_spec(leaf(window=2000), 8)
+        for bad in (299, 2001, 50):
+            with self.assertRaises(SupervisorError):
+                validate_generated_spec(leaf(window=bad), 8)
+        for bad in (-1.6, 1.1):
+            with self.assertRaises(SupervisorError):
+                validate_generated_spec(leaf(threshold=bad), 8)
+        # an ordinary leaf keeps the 600 ceiling
+        with self.assertRaises(SupervisorError):
+            validate_generated_spec(
+                {"entry": {"all": [{"type": "close_above_sma", "window": 800, "threshold": 0.0}]},
+                 "exit": {"any": [{"type": "close_below_sma", "window": 50, "threshold": 0.0}]}}, 8)
+        # the schema the model is decoded against must carry the same bounds,
+        # or the model can emit a window the validator will then reject.
+        defs = json.dumps(spec_rule_defs())
+        seg = defs[defs.index('"memory_order_above"'):]
+        window = seg[seg.index('"window"'):seg.index('"window"') + 90]
+        self.assertIn('"minimum": 300', window)
+        self.assertIn('"maximum": 2000', window)
+
     def test_spec_schema_describes_every_leaf_exactly(self):
         schema = proposal_schema("generated_spec")
         leaves = schema["$defs"]["leaf"]["anyOf"]
@@ -408,6 +498,25 @@ class SupervisorTests(unittest.TestCase):
         schema = proposal_schema("generated_spec")
         sma = next(l for l in schema["$defs"]["leaf"]["anyOf"] if l["properties"]["type"]["enum"] == ["close_above_sma"])
         self.assertEqual(sma["properties"]["window"]["minimum"], MIN_TREND_WINDOW)
+
+    def test_prompt_describes_every_leaf_and_its_window_bounds(self):
+        """LEAF_SPEC drives validator, schema and prompt; the prompt must not lag.
+
+        Adding a leaf in code while the prompt still lists the old set would let
+        the schema accept something the model was never told about - and, worse,
+        the prompt's window intuition (6 = a day, 180 = a month) is wrong for any
+        leaf needing a long estimation window, so a non-default range has to be
+        stated or the model burns attempts on values the schema then rejects.
+        """
+        system, user = generator_prompts("generated_spec", 1, "", self.mission, self.families,
+                                         None, [], [], {}, {}, None)
+        full = system + "\n" + user
+        for name, spec in LEAF_SPEC.items():
+            self.assertIn(name, full, f"{name} is in LEAF_SPEC but never reaches the generator prompt")
+            bounds = spec.get("window_range")
+            if bounds:
+                self.assertIn(f"{bounds[0]}-{bounds[1]} bars", full,
+                              f"{name} has non-default window bounds that the prompt never states")
 
     def test_prompt_states_plateau_and_novelty_rules(self):
         incumbent = [{"sharpe": 0.09, "max_drawdown_pct": 19.0}, {"sharpe": 2.22, "max_drawdown_pct": 13.4}, {"sharpe": 0.29, "max_drawdown_pct": 15.0}]

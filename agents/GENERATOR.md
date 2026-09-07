@@ -76,6 +76,7 @@ bars; the supervisor sends the same table in every generated_spec prompt):
 | `relative_volume_above` | window, threshold | ratio to the prior-window mean volume |
 | `vol_rank_above`, `vol_rank_below` | window, threshold, `rank_window`? | percentile 0-1 of realized volatility in its own history |
 | `market_zscore_above`, `market_zscore_below` | window, threshold, `vol_window`? | the same z-score on BTC_USDT, one bar late; the only leaf that reads another market |
+| `memory_order_above`, `memory_order_below` | window (**300-2000**), threshold | order alpha of the trailing volatility autocorrelation, estimated causally (`math/spiral.h`); alpha ~ -1 integer order, -1 < alpha < 0 fractional. A regime gate, not an entry trigger |
 | `atr_trailing_stop` | window, threshold | ATR multiple k; true while in a position and close < highest close since entry - k x ATR; exit trees only |
 | `weekday` | day | 0-6 UTC, Sunday = 0 |
 | `green_candle`, `red_candle` | none | close above / below open |

@@ -33,7 +33,7 @@ from typing import Any, Iterator
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
-DEFAULT_MISSION = PROJECT_ROOT / "missions" / "local-trend-discovery-v4.json"
+DEFAULT_MISSION = PROJECT_ROOT / "missions" / "local-trend-discovery-v6.json"
 DEFAULT_DB = PROJECT_ROOT / "state" / "research-v2.sqlite3"
 DEFAULT_ARTIFACTS = PROJECT_ROOT / "artifacts-v2"
 DEFAULT_HEARTBEAT = PROJECT_ROOT / "state" / "heartbeat-v2.json"
@@ -262,6 +262,34 @@ def validate_mission(path: Path) -> dict[str, Any]:
     if data_policy.get("allow_data_fetch"):
         raise SupervisorError("autonomous data fetching is forbidden")
 
+    # The generated_spec leaf set defines the space the model searches, so a
+    # change to it is a policy change exactly like a quota or a gate. The
+    # mission file is hash-guarded; pinning the vocabulary here is what makes
+    # that guard cover the rule language too. Widening LEAF_SPEC without a new
+    # mission would silently pool candidates drawn from different spaces.
+    # A leaf whose lookback can exceed the warm-up is undefined for the opening
+    # stretch of every fold, so its measured performance depends on its own
+    # parameter rather than on the market. That is how the v5 memory_order
+    # results were confounded; the check exists so it cannot recur silently.
+    warmup = int(mission["evaluation"].get("warmup_bars", 0))
+    for name, spec in LEAF_SPEC.items():
+        bounds = spec.get("window_range")
+        if bounds and bounds[1] > warmup:
+            raise SupervisorError(
+                f"leaf {name} allows a window up to {bounds[1]} bars but the mission warms up only "
+                f"{warmup}: it would be undefined for the first {bounds[1] - warmup} bars of every "
+                "fold. Raise warmup_bars or lower the leaf's window ceiling.")
+    pinned = mission.get("spec_leaf_vocabulary")
+    if pinned is not None:
+        actual = sorted(LEAF_SPEC)
+        if sorted(pinned) != actual:
+            added = sorted(set(actual) - set(pinned))
+            removed = sorted(set(pinned) - set(actual))
+            raise SupervisorError(
+                "the generated_spec leaf vocabulary no longer matches this mission's "
+                f"spec_leaf_vocabulary (added: {added or 'none'}, removed: {removed or 'none'}). "
+                "Changing the rule language changes the search space: author a new mission id "
+                "rather than pooling candidates from two different spaces.")
     repo = resolve_inside(PROJECT_ROOT / mission["source_repo"], PROJECT_ROOT.parent, "source_repo")
     if repo.name != "cli_trader":
         raise SupervisorError(f"source_repo must resolve to cli_trader, got {repo}")
@@ -588,7 +616,8 @@ def spec_rule_defs() -> dict[str, Any]:
         props: dict[str, Any] = {"type": {"type": "string", "enum": [name]}}
         for field in spec["fields"]:
             if field == "window":
-                props["window"] = {"type": "integer", "minimum": MIN_TREND_WINDOW if name in TREND_LEAVES else 2, "maximum": 600}
+                lo, hi = spec.get("window_range") or ((MIN_TREND_WINDOW if name in TREND_LEAVES else 2), 600)
+                props["window"] = {"type": "integer", "minimum": lo, "maximum": hi}
             elif field == "threshold":
                 lo, hi = spec["range"]
                 props["threshold"] = {"type": "number", "minimum": lo, "maximum": hi}
@@ -614,7 +643,15 @@ def leaf_reference_lines() -> list[str]:
     lines = []
     for name, spec in LEAF_SPEC.items():
         fields = ", ".join(spec["fields"] + tuple(f"{e}?" for e in spec["extra"])) or "no fields"
-        lines.append(f"- {name} ({fields}): {spec['unit']}")
+        # A leaf whose window bounds differ from the default must say so here.
+        # The header's window intuition (6 = a day, 180 = a month) is the right
+        # scale for almost every leaf and badly wrong for the few that need a
+        # long estimation window; the JSON schema would reject the mismatch, but
+        # only after the model has already spent the attempt.
+        bounds = spec.get("window_range")
+        guide = spec.get("window_guidance", "")
+        suffix = f" Window {bounds[0]}-{bounds[1]} bars.{guide}" if bounds else ""
+        lines.append(f"- {name} ({fields}): {spec['unit']}{suffix}")
     return lines
 
 
@@ -1580,6 +1617,12 @@ LEAF_SPEC: dict[str, dict[str, Any]] = {
     "vol_rank_below": {"fields": ("window", "threshold"), "extra": ("rank_window",), "range": (0.0, 1.0), "unit": "percentile 0-1; 0.3 means calmer than 70% of recent history"},
     "market_zscore_above": {"fields": ("window", "threshold"), "extra": ("vol_window",), "range": (-5.0, 5.0), "unit": "the same z-score read on BTC_USDT, the market factor, one bar late; the ONLY leaf that uses information outside the coin itself"},
     "market_zscore_below": {"fields": ("window", "threshold"), "extra": ("vol_window",), "range": (-5.0, 5.0), "unit": "BTC z-score below the level, one bar late"},
+    "memory_order_above": {"fields": ("window", "threshold"), "extra": (), "range": (-1.5, 1.0), "window_range": (300, 2000),
+        "window_guidance": " The window sets how fast the regime turns over, measured on 4h crypto: 500 bars gives about 35-day regimes, 1000 about 80-day, 1500 about 100-day. Pick it for the regime length you mean, not for length itself.",
+        "unit": "order alpha of the trailing volatility autocorrelation, estimated causally by the logarithmic-spiral method over `window` bars (math/spiral.h). alpha ~ -1 is an INTEGER order (exponential relaxation, ARMA-like); -1 < alpha < 0 is FRACTIONAL (power-law memory, ACF ~ k^-(alpha+1)). Measured on 4h crypto it runs about -0.8..+0.7, median near -0.2. Use it as a REGIME gate - 'trade the trend rule only where memory is resolvably fractional' - not as an entry trigger on its own"},
+    "memory_order_below": {"fields": ("window", "threshold"), "extra": (), "range": (-1.5, 1.0), "window_range": (300, 2000),
+        "window_guidance": " The window sets the regime turnover rate; see memory_order_above.",
+        "unit": "as memory_order_above, but true when the estimated order is BELOW the threshold (more integer-like / exponential memory)"},
     "atr_trailing_stop": {"fields": ("window", "threshold"), "extra": (), "range": (0.5, 10.0), "unit": "ATR multiple k: true while a position is open and close < highest close since entry - k*ATR(window); EXIT trees only, always false in an entry tree"},
     "weekday": {"fields": ("day",), "extra": (), "range": None, "unit": "day 0-6 in UTC, Sunday=0, Monday=1, ... Saturday=6"},
     "green_candle": {"fields": (), "extra": (), "range": None, "unit": "close above open on this bar"},
@@ -1712,10 +1755,13 @@ def validate_spec_node(value: Any, depth: int = 0) -> int:
             raise SupervisorError("generated spec weekday day must be an integer from 0 to 6")
     if "window" in spec["fields"]:
         window = value.get("window")
-        floor = MIN_TREND_WINDOW if leaf in TREND_LEAVES else 2
-        if isinstance(window, bool) or not isinstance(window, int) or not floor <= window <= 600:
-            raise SupervisorError(f"generated spec {leaf} window must be an integer from {floor} to 600"
-                                  + (" (two days of 4h bars; shorter trend windows are fee-dead)" if floor > 2 else ""))
+        floor, ceiling = spec.get("window_range") or ((MIN_TREND_WINDOW if leaf in TREND_LEAVES else 2), 600)
+        if isinstance(window, bool) or not isinstance(window, int) or not floor <= window <= ceiling:
+            raise SupervisorError(f"generated spec {leaf} window must be an integer from {floor} to {ceiling}"
+                                  + (" (two days of 4h bars; shorter trend windows are fee-dead)"
+                                     if floor == MIN_TREND_WINDOW else "")
+                                  + (" (the order estimator needs a long window to see a power-law tail)"
+                                     if leaf.startswith("memory_order") else ""))
     if spec["range"] is not None:
         threshold = numeric(value["threshold"], "generated spec threshold")
         lo, hi = spec["range"]
